@@ -163,14 +163,61 @@ class Redis:
             elif command == "GET":
                 await self._handle_get(args, writer)
             elif command == "WAIT":
-                # Get the current number of connected replicas
-                replica_count = len(self.replication.replicas)
-                print(f"WAIT command received. Currently {replica_count} replicas connected.")
+                # Process WAIT command - wait for replica acknowledgments
+                num_replicas = 0
+                timeout_ms = 0
+                
+                # Parse arguments
+                if len(args) >= 1:
+                    try:
+                        num_replicas = int(args[0])
+                    except ValueError:
+                        writer.write(RESPProtocol.encode_error("value is not an integer"))
+                        await writer.drain()
+                        return
+                        
+                if len(args) >= 2:
+                    try:
+                        timeout_ms = int(args[1])
+                    except ValueError:
+                        writer.write(RESPProtocol.encode_error("timeout is not an integer"))
+                        await writer.drain()
+                        return
                 
                 # First clean up any closed connections
                 self.replication.cleanup_replicas()
+                replica_count = len(self.replication.replicas)
                 
-                # Return the actual count of connected replicas
+                print(f"WAIT command: waiting for {num_replicas} replicas (have {replica_count}) with timeout {timeout_ms}ms")
+                
+                # If no replicas connected or requested count is 0, return immediately
+                if replica_count == 0 or num_replicas == 0:
+                    writer.write(RESPProtocol.encode_integer(0))
+                    await writer.drain()
+                    return
+                
+                # Check if we need to wait (if we have fewer replicas than requested)
+                if replica_count < num_replicas:
+                    # Just wait for the timeout, then return what we have
+                    start_time = self.get_current_time_ms()
+                    end_time = start_time + timeout_ms
+                    
+                    # Send REPLCONF GETACK to all replicas
+                    for replica_writer in self.replication.replicas:
+                        if not replica_writer.is_closing():
+                            try:
+                                getack_cmd = RESPProtocol.encode_array(["REPLCONF", "GETACK", "*"])
+                                replica_writer.write(getack_cmd)
+                                await replica_writer.drain()
+                            except Exception as e:
+                                print(f"Error sending GETACK to replica: {e}")
+                    
+                    # Wait for timeout
+                    while self.get_current_time_ms() < end_time:
+                        await asyncio.sleep(0.01)  # Small sleep to avoid hogging CPU
+                
+                # Return the actual count of acked replicas (for now, just all connected replicas)
+                # In a real implementation, we'd track which replicas actually acked
                 replica_count = len(self.replication.replicas)
                 writer.write(RESPProtocol.encode_integer(replica_count))
             else:
