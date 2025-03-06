@@ -190,6 +190,20 @@ async def connect_to_master(host: str, port: int, replica_port: int):
             writer.close()
             return None, None
             
+        # Send PSYNC command
+        psync_cmd = b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"
+        print(f"Sending PSYNC: {psync_cmd!r}")
+        writer.write(psync_cmd)
+        await writer.drain()
+        
+        # Read FULLRESYNC response (we'll ignore the details for now)
+        response = await reader.read(1024)
+        print(f"Received from master: {response!r}")
+        if not response or not response.startswith(b"+FULLRESYNC"):
+            print("Failed to receive FULLRESYNC response")
+            writer.close()
+            return None, None
+            
         return reader, writer
     except Exception as e:
         print(f"Failed to connect to master: {e}")
