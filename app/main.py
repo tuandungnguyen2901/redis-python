@@ -14,7 +14,8 @@ server_config = {
     "master_host": None,
     "master_port": None,
     "master_replid": "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",  # Hardcoded replication ID
-    "master_repl_offset": 0  # Starting offset
+    "master_repl_offset": 0,  # Starting offset
+    "replicas": set()  # Store replica writers
 }
 
 # Replace the existing EMPTY_RDB_HEX with this one
@@ -46,6 +47,31 @@ def format_info_response(section=None):
 def get_empty_rdb():
     """Return empty RDB file contents"""
     return bytes.fromhex(EMPTY_RDB_HEX)
+
+def format_command_for_replication(command, *args):
+    """Format command and args as RESP array for replication"""
+    parts = [command, *args]
+    array = f"*{len(parts)}\r\n"
+    for part in parts:
+        array += f"${len(part)}\r\n{part}\r\n"
+    return array.encode()
+
+async def propagate_to_replicas(command, *args):
+    """Send command to all connected replicas"""
+    if not server_config["replicas"]:
+        return
+        
+    try:
+        # Format command as RESP array
+        cmd_bytes = format_command_for_replication(command, *args)
+        
+        # Send to all replicas
+        for writer in server_config["replicas"]:
+            if not writer.is_closing():
+                writer.write(cmd_bytes)
+                await writer.drain()
+    except Exception as e:
+        print(f"Error propagating command: {e}")
 
 async def handle_client(reader, writer):
     addr = writer.get_extra_info("peername")
@@ -125,10 +151,12 @@ async def handle_client(reader, writer):
                     writer.write(resp.encode())
                 elif command == "REPLCONF":
                     print(f"Received REPLCONF with args: {args}")
+                    # Add writer to replicas set if this is a replication connection
+                    if args and args[0] == "listening-port":
+                        server_config["replicas"].add(writer)
                     writer.write(b"+OK\r\n")
                 elif command == "PSYNC":
                     print(f"Received PSYNC with args: {args}")
-                    # Respond with FULLRESYNC, replication ID and offset
                     repl_id = server_config["master_replid"]
                     offset = server_config["master_repl_offset"]
                     response = f"+FULLRESYNC {repl_id} {offset}\r\n"
@@ -139,8 +167,11 @@ async def handle_client(reader, writer):
                     rdb_contents = get_empty_rdb()
                     rdb_length = len(rdb_contents)
                     writer.write(f"${rdb_length}\r\n".encode())
-                    writer.write(rdb_contents)  # No \r\n at the end
+                    writer.write(rdb_contents)
                     await writer.drain()
+                    
+                    # Add this connection to replicas set if not already added
+                    server_config["replicas"].add(writer)
                 elif command == "INFO":
                     # Handle INFO command with optional section argument
                     section = args[0].lower() if args else None
@@ -150,7 +181,7 @@ async def handle_client(reader, writer):
                     key, value = args[0], args[1]
                     expiry = None
                     
-                    # Check for PX argument
+                    # Handle PX argument
                     if len(args) >= 4 and args[2].upper() == "PX":
                         try:
                             px_value = int(args[3])
@@ -159,8 +190,12 @@ async def handle_client(reader, writer):
                             writer.write(b"-ERR value is not an integer or out of range\r\n")
                             continue
                     
+                    # Store the value
                     data_store[key] = (value, expiry)
                     writer.write(b"+OK\r\n")
+                    
+                    # Propagate the SET command to replicas
+                    await propagate_to_replicas("SET", key, value, *args[2:])
                 elif command == "GET":
                     if len(args) >= 1:
                         key = args[0]
@@ -189,6 +224,9 @@ async def handle_client(reader, writer):
     
     print("Client disconnected")
     writer.close()
+    
+    # Clean up closed connections in replicas set
+    server_config["replicas"] = {w for w in server_config["replicas"] if not w.is_closing()}
 
 async def connect_to_master(host: str, port: int, replica_port: int):
     """Establish connection to master server"""
