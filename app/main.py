@@ -1,8 +1,20 @@
 import socket
 import asyncio
+import time
 
-# Add a dictionary to store key-value pairs
+# Store both value and expiry timestamp (in ms since epoch)
 data_store = {}
+
+def get_current_time_ms():
+    return int(time.time() * 1000)
+
+def is_key_expired(key):
+    if key not in data_store:
+        return True
+    value, expiry = data_store[key]
+    if expiry is None:
+        return False
+    return get_current_time_ms() >= expiry
 
 async def handle_client(reader, writer):
     addr = writer.get_extra_info("peername")
@@ -60,20 +72,34 @@ async def handle_client(reader, writer):
                 resp = f"${len(echo_arg)}\r\n{echo_arg}\r\n"
                 writer.write(resp.encode())
                 print(f"Sending ECHO response: {resp}")
-            # Add SET command handler
+            # Updated SET command handler with PX support
             elif command == "SET" and len(args) >= 2:
                 key, value = args[0], args[1]
-                data_store[key] = value
+                expiry = None
+                
+                # Check for PX argument
+                if len(args) >= 4 and args[2].upper() == "PX":
+                    try:
+                        px_value = int(args[3])
+                        expiry = get_current_time_ms() + px_value
+                    except ValueError:
+                        writer.write(b"-ERR value is not an integer or out of range\r\n")
+                        continue
+                
+                data_store[key] = (value, expiry)
                 writer.write(b"+OK\r\n")
-            # Add GET command handler
+            # Updated GET command handler with expiry check
             elif command == "GET":
                 if len(args) >= 1:
                     key = args[0]
-                    value = data_store.get(key)
-                    if value is not None:
+                    if key in data_store and not is_key_expired(key):
+                        value, _ = data_store[key]
                         resp = f"${len(value)}\r\n{value}\r\n"
                         writer.write(resp.encode())
                     else:
+                        # Remove expired key if it exists
+                        if key in data_store and is_key_expired(key):
+                            del data_store[key]
                         writer.write(b"$-1\r\n")  # Redis nil response
                 else:
                     writer.write(b"-ERR wrong number of arguments for 'get' command\r\n")
