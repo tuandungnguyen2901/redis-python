@@ -162,6 +162,10 @@ class Redis:
                 await self._handle_set(args, writer)
             elif command == "GET":
                 await self._handle_get(args, writer)
+            elif command == "WAIT":
+                # Handle WAIT command (for replication acknowledgement)
+                # For now, just return 0 as specified in the requirements
+                writer.write(RESPProtocol.encode_integer(0))
             else:
                 writer.write(RESPProtocol.encode_error("unknown command"))
             
