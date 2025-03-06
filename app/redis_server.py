@@ -514,9 +514,100 @@ class Redis:
         transaction = self.transactions[writer]
         queued_commands = transaction.get("commands", [])
         
-        # For now, we just handle empty transactions
-        # Return an empty array response
-        writer.write(b"*0\r\n")
+        # If no commands were queued, return an empty array
+        if not queued_commands:
+            writer.write(b"*0\r\n")
+            del self.transactions[writer]
+            return
+        
+        # Execute all queued commands and collect their responses
+        responses = []
+        for command, args in queued_commands:
+            # Execute the command, capturing the response
+            response = await self._execute_transaction_command(command, args)
+            responses.append(response)
+        
+        # Build the array response
+        array_response = f"*{len(responses)}\r\n".encode()
+        for resp in responses:
+            array_response += resp
+        
+        # Send the combined response
+        writer.write(array_response)
         
         # Remove the transaction state for this client
         del self.transactions[writer]
+
+    async def _execute_transaction_command(self, command: str, args: list) -> bytes:
+        """Execute a command within a transaction and return its response without sending to client"""
+        try:
+            if command == "PING":
+                return b"+PONG\r\n"
+            elif command == "ECHO" and args:
+                return RESPProtocol.encode_bulk_string(args[0])
+            elif command == "SET" and len(args) >= 2:
+                key, value = args[0], args[1]
+                expiry = None
+                
+                if len(args) >= 4 and args[2].upper() == "PX":
+                    try:
+                        px_value = int(args[3])
+                        expiry = self.get_current_time_ms() + px_value
+                    except ValueError:
+                        return RESPProtocol.encode_error("value is not an integer or out of range")
+                    
+                self.data_store[key] = (value, expiry)
+                
+                # Propagate to replicas after executing the command
+                await self.replication.propagate_to_replicas("SET", key, value, *args[2:])
+                
+                return RESPProtocol.encode_simple_string("OK")
+            elif command == "GET":
+                if len(args) == 1:
+                    key = args[0]
+                    
+                    if key in self.data_store:
+                        if self.is_key_expired(key):
+                            del self.data_store[key]
+                            return RESPProtocol.encode_bulk_string(None)
+                        else:
+                            value, _ = self.data_store[key]
+                            return RESPProtocol.encode_bulk_string(value)
+                    else:
+                        return RESPProtocol.encode_bulk_string(None)
+                else:
+                    return RESPProtocol.encode_error("wrong number of arguments for 'get' command")
+            elif command == "INCR":
+                if len(args) != 1:
+                    return RESPProtocol.encode_error("wrong number of arguments for 'incr' command")
+                
+                key = args[0]
+                
+                if key in self.data_store and not self.is_key_expired(key):
+                    value, expiry = self.data_store[key]
+                    
+                    try:
+                        int_value = int(value)
+                        int_value += 1
+                        
+                        self.data_store[key] = (str(int_value), expiry)
+                        
+                        # Propagate to replicas
+                        await self.replication.propagate_to_replicas("INCR", key)
+                        
+                        return RESPProtocol.encode_integer(int_value)
+                    except ValueError:
+                        return RESPProtocol.encode_error("ERR value is not an integer or out of range")
+                else:
+                    self.data_store[key] = ("1", None)
+                    
+                    # Propagate to replicas
+                    await self.replication.propagate_to_replicas("INCR", key)
+                    
+                    return RESPProtocol.encode_integer(1)
+            else:
+                return RESPProtocol.encode_error(f"unknown command '{command}'")
+            
+        except Exception as e:
+            print(f"Error executing transaction command: {e}")
+            return RESPProtocol.encode_error("execution error")
