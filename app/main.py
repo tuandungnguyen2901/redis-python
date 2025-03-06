@@ -1,6 +1,9 @@
 import socket
 import asyncio
 
+# Add a dictionary to store key-value pairs
+data_store = {}
+
 async def handle_client(reader, writer):
     addr = writer.get_extra_info("peername")
     print("Connected", addr)
@@ -57,13 +60,30 @@ async def handle_client(reader, writer):
                 resp = f"${len(echo_arg)}\r\n{echo_arg}\r\n"
                 writer.write(resp.encode())
                 print(f"Sending ECHO response: {resp}")
+            # Add SET command handler
+            elif command == "SET" and len(args) >= 2:
+                key, value = args[0], args[1]
+                data_store[key] = value
+                writer.write(b"+OK\r\n")
+            # Add GET command handler
+            elif command == "GET":
+                if len(args) >= 1:
+                    key = args[0]
+                    value = data_store.get(key)
+                    if value is not None:
+                        resp = f"${len(value)}\r\n{value}\r\n"
+                        writer.write(resp.encode())
+                    else:
+                        writer.write(b"$-1\r\n")  # Redis nil response
+                else:
+                    writer.write(b"-ERR wrong number of arguments for 'get' command\r\n")
             else:
                 # Default response for unknown commands
-                writer.write(b"+PONG\r\n")
+                writer.write(b"-ERR unknown command\r\n")
                 
         except Exception as e:
             print(f"Error parsing command: {e}")
-            writer.write(b"+ERR parsing error\r\n")
+            writer.write(b"-ERR parsing error\r\n")
             
         await writer.drain()
     
