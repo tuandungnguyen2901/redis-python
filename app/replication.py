@@ -2,6 +2,7 @@ from typing import Set, Optional, Tuple
 from asyncio import StreamWriter, StreamReader
 import asyncio
 from resp import RESPProtocol
+import gc
 
 class ReplicationManager:
     """Handle Redis replication logic"""
@@ -37,13 +38,127 @@ class ReplicationManager:
     
     async def handle_master_connection(self, reader: StreamReader, writer: StreamWriter) -> None:
         """Handle ongoing communication with master"""
+        buffer = b""
+        redis_instance = None
+        
+        # This is a bit of a hack - we need to get a reference to the Redis instance
+        # that owns this ReplicationManager. We could also pass it as a parameter.
+        from redis_server import Redis
+        for obj in gc.get_objects():
+            if isinstance(obj, Redis) and obj.replication is self:
+                redis_instance = obj
+                break
+        
+        if not redis_instance:
+            print("Error: Could not find Redis instance")
+            return
+        
         try:
             while True:
                 data = await reader.read(1024)
                 if not data:
                     print("Master connection closed")
                     break
-                print(f"Received from master: {data}")
+                
+                # Append to buffer and process any complete commands
+                buffer += data
+                
+                # Process commands from buffer
+                while buffer:
+                    # Check for complete command
+                    if not buffer.startswith(b"*"):
+                        # Invalid format, clear buffer
+                        print(f"Invalid data received from master: {buffer[:20]!r}...")
+                        buffer = b""
+                        break
+                        
+                    # Parse RESP array command
+                    try:
+                        # Find array length from first line
+                        first_line_end = buffer.find(b"\r\n")
+                        if first_line_end == -1:
+                            break  # Incomplete command
+                        
+                        array_length = int(buffer[1:first_line_end])
+                        
+                        # Count expected \r\n
+                        expected_crlf = 1 + (array_length * 2)  # 1 for array marker, 2 per item (length+value)
+                        
+                        # Find all \r\n
+                        crlf_count = 0
+                        pos = 0
+                        while True:
+                            pos = buffer.find(b"\r\n", pos)
+                            if pos == -1:
+                                break
+                            crlf_count += 1
+                            pos += 2
+                        
+                        if crlf_count < expected_crlf:
+                            break  # Incomplete command
+                        
+                        # Parse command and args
+                        command = None
+                        args = []
+                        
+                        lines = buffer.split(b"\r\n")
+                        index = 1  # Skip the array length line
+                        
+                        for i in range(array_length):
+                            if index >= len(lines) or not lines[index].startswith(b"$"):
+                                break
+                            
+                            # Skip the length marker
+                            index += 1
+                            
+                            if index >= len(lines):
+                                break
+                            
+                            # Get the value
+                            value = lines[index].decode("utf-8")
+                            if i == 0:
+                                command = value.upper()
+                            else:
+                                args.append(value)
+                            
+                            index += 1
+                        
+                        # Calculate command length in bytes
+                        cmd_end = 0
+                        for i in range(expected_crlf):
+                            cmd_end = buffer.find(b"\r\n", cmd_end) + 2
+                        
+                        # Process the command
+                        if command:
+                            print(f"Processing master command: {command} {args}")
+                            
+                            # Execute the command on replica
+                            if command == "SET" and len(args) >= 2:
+                                key, value = args[0], args[1]
+                                expiry = None
+                                
+                                # Handle PX argument
+                                if len(args) >= 4 and args[2].upper() == "PX":
+                                    try:
+                                        px_value = int(args[3])
+                                        expiry = redis_instance.get_current_time_ms() + px_value
+                                    except ValueError:
+                                        print(f"Invalid PX value: {args[3]}")
+                                    
+                                # Store in redis instance
+                                redis_instance.data_store[key] = (value, expiry)
+                            # Add other command handlers as needed
+                            
+                        # Remove the processed command from buffer
+                        buffer = buffer[cmd_end:]
+                        
+                    except (ValueError, IndexError) as e:
+                        print(f"Error parsing command from master: {e}")
+                        if b"\r\n" in buffer:
+                            buffer = buffer[buffer.find(b"\r\n") + 2:]
+                        else:
+                            buffer = b""
+                        
         except Exception as e:
             print(f"Error in master connection: {e}")
         finally:
