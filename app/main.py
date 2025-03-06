@@ -11,7 +11,9 @@ data_store: Dict[str, Tuple[str, Optional[int]]] = {}
 server_config = {
     "role": "master",
     "master_host": None,
-    "master_port": None
+    "master_port": None,
+    "master_replid": "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",  # Hardcoded replication ID
+    "master_repl_offset": 0  # Starting offset
 }
 
 def get_current_time_ms():
@@ -28,7 +30,12 @@ def is_key_expired(key):
 def format_info_response(section=None):
     """Format INFO response according to RESP protocol"""
     if section == "replication":
-        info_str = f"role:{server_config['role']}"
+        info_lines = [
+            f"role:{server_config['role']}",
+            f"master_replid:{server_config['master_replid']}",
+            f"master_repl_offset:{server_config['master_repl_offset']}"
+        ]
+        info_str = "\n".join(info_lines)
         return f"${len(info_str)}\r\n{info_str}\r\n"
     return "$-1\r\n"  # Return nil for unknown sections
 
