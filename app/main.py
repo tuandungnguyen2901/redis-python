@@ -42,102 +42,127 @@ def format_info_response(section=None):
 async def handle_client(reader, writer):
     addr = writer.get_extra_info("peername")
     print("Connected", addr)
+    buffer = ""
     while True:
-        data = await reader.read(1024)
-        if not data:
-            break
-        
-        message = data.decode()
-        print("Data:", message)
-        
-        # Parse RESP protocol input
-        lines = message.split('\r\n')
-        print("Parsed lines:", lines)
-        
-        # Handle RESP array format
-        command = None
-        args = []
-        
         try:
-            # Check if it's an array command
-            if lines[0].startswith('*'):
-                array_length = int(lines[0][1:])
-                item_index = 1
+            data = await reader.read(1024)
+            if not data:
+                break
+            
+            # Append new data to buffer
+            buffer += data.decode()
+            
+            # Process complete commands from buffer
+            while '\r\n' in buffer:
+                # Find the first complete command
+                message, *remaining = buffer.split('\r\n', 1)
+                if not message:
+                    buffer = remaining[0] if remaining else ""
+                    continue
                 
-                for i in range(array_length):
-                    if item_index < len(lines) and lines[item_index].startswith('$'):
-                        bulk_length = int(lines[item_index][1:])
-                        item_index += 1
-                        
-                        if item_index < len(lines):
-                            if command is None:
-                                command = lines[item_index].upper()
-                                print(f"Command detected: {command}")
-                            else:
-                                args.append(lines[item_index])
-                                print(f"Argument detected: {lines[item_index]}")
-                            
-                            item_index += 1
-            else:
-                # Simple command parsing (fallback)
-                parts = message.strip().split()
-                command = parts[0].upper() if parts else ""
-                args = parts[1:] if len(parts) > 1 else []
+                # Parse RESP protocol input
+                lines = [message]
+                if remaining:
+                    lines.extend(remaining[0].split('\r\n'))
+                print("Parsed lines:", lines)
                 
-            print(f"Processed command: {command}, args: {args}")
+                # Handle RESP array format
+                command = None
+                args = []
                 
-            # Execute the command
-            if command == "PING":
-                writer.write(b"+PONG\r\n")
-            elif command == "ECHO" and args:
-                echo_arg = args[0]
-                # Format as RESP bulk string
-                resp = f"${len(echo_arg)}\r\n{echo_arg}\r\n"
-                writer.write(resp.encode())
-                print(f"Sending ECHO response: {resp}")
-            elif command == "INFO":
-                # Handle INFO command with optional section argument
-                section = args[0].lower() if args else None
-                resp = format_info_response(section)
-                writer.write(resp.encode())
-            elif command == "SET" and len(args) >= 2:
-                key, value = args[0], args[1]
-                expiry = None
-                
-                # Check for PX argument
-                if len(args) >= 4 and args[2].upper() == "PX":
+                # Check if it's an array command
+                if lines[0].startswith('*'):
                     try:
-                        px_value = int(args[3])
-                        expiry = get_current_time_ms() + px_value
-                    except ValueError:
-                        writer.write(b"-ERR value is not an integer or out of range\r\n")
+                        array_length = int(lines[0][1:])
+                        expected_lines = 2 + (2 * array_length)  # Array count + (length + value) pairs
+                        
+                        # Check if we have all the lines we need
+                        if len(lines) < expected_lines:
+                            break  # Wait for more data
+                        
+                        item_index = 1
+                        for i in range(array_length):
+                            if lines[item_index].startswith('$'):
+                                item_index += 1
+                                if command is None:
+                                    command = lines[item_index].upper()
+                                    print(f"Command detected: {command}")
+                                else:
+                                    args.append(lines[item_index])
+                                    print(f"Argument detected: {lines[item_index]}")
+                                item_index += 1
+                        
+                        # Remove processed command from buffer
+                        buffer = '\r\n'.join(lines[expected_lines:])
+                    except (ValueError, IndexError) as e:
+                        print(f"Error parsing array command: {e}")
+                        writer.write(b"-ERR protocol error\r\n")
+                        await writer.drain()
                         continue
-                
-                data_store[key] = (value, expiry)
-                writer.write(b"+OK\r\n")
-            elif command == "GET":
-                if len(args) >= 1:
-                    key = args[0]
-                    if key in data_store and not is_key_expired(key):
-                        value, _ = data_store[key]
-                        resp = f"${len(value)}\r\n{value}\r\n"
-                        writer.write(resp.encode())
-                    else:
-                        # Remove expired key if it exists
-                        if key in data_store and is_key_expired(key):
-                            del data_store[key]
-                        writer.write(b"$-1\r\n")  # Redis nil response
                 else:
-                    writer.write(b"-ERR wrong number of arguments for 'get' command\r\n")
-            else:
-                # Default response for unknown commands
-                writer.write(b"-ERR unknown command\r\n")
+                    # Simple command parsing (fallback)
+                    parts = message.strip().split()
+                    command = parts[0].upper() if parts else ""
+                    args = parts[1:] if len(parts) > 1 else []
+                    buffer = remaining[0] if remaining else ""
+                
+                print(f"Processed command: {command}, args: {args}")
+                
+                # Execute the command
+                if command == "PING":
+                    writer.write(b"+PONG\r\n")
+                elif command == "ECHO" and args:
+                    echo_arg = args[0]
+                    resp = f"${len(echo_arg)}\r\n{echo_arg}\r\n"
+                    writer.write(resp.encode())
+                elif command == "REPLCONF":
+                    print(f"Received REPLCONF with args: {args}")
+                    writer.write(b"+OK\r\n")
+                elif command == "INFO":
+                    # Handle INFO command with optional section argument
+                    section = args[0].lower() if args else None
+                    resp = format_info_response(section)
+                    writer.write(resp.encode())
+                elif command == "SET" and len(args) >= 2:
+                    key, value = args[0], args[1]
+                    expiry = None
+                    
+                    # Check for PX argument
+                    if len(args) >= 4 and args[2].upper() == "PX":
+                        try:
+                            px_value = int(args[3])
+                            expiry = get_current_time_ms() + px_value
+                        except ValueError:
+                            writer.write(b"-ERR value is not an integer or out of range\r\n")
+                            continue
+                    
+                    data_store[key] = (value, expiry)
+                    writer.write(b"+OK\r\n")
+                elif command == "GET":
+                    if len(args) >= 1:
+                        key = args[0]
+                        if key in data_store and not is_key_expired(key):
+                            value, _ = data_store[key]
+                            resp = f"${len(value)}\r\n{value}\r\n"
+                            writer.write(resp.encode())
+                        else:
+                            # Remove expired key if it exists
+                            if key in data_store and is_key_expired(key):
+                                del data_store[key]
+                            writer.write(b"$-1\r\n")  # Redis nil response
+                    else:
+                        writer.write(b"-ERR wrong number of arguments for 'get' command\r\n")
+                else:
+                    # Default response for unknown commands
+                    writer.write(b"-ERR unknown command\r\n")
+                
+                await writer.drain()
                 
         except Exception as e:
-            print(f"Error parsing command: {e}")
-            writer.write(b"-ERR parsing error\r\n")
-            
-        await writer.drain()
+            print(f"Error handling client: {e}")
+            writer.write(b"-ERR internal error\r\n")
+            await writer.drain()
+            break
     
     print("Client disconnected")
     writer.close()
