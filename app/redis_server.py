@@ -181,7 +181,9 @@ class Redis:
                 await self._handle_multi(writer)
             elif command == "EXEC":
                 await self._handle_exec(writer)
-            # If this client is in a transaction and command is not MULTI/EXEC, queue the command
+            elif command == "DISCARD":
+                await self._handle_discard(writer)
+            # If this client is in a transaction and command is not MULTI/EXEC/DISCARD, queue the command
             elif writer in self.transactions:
                 # Queue the command for later execution
                 self.transactions[writer]["commands"].append((command, args))
@@ -611,3 +613,17 @@ class Redis:
         except Exception as e:
             print(f"Error executing transaction command: {e}")
             return RESPProtocol.encode_error("execution error")
+
+    async def _handle_discard(self, writer: StreamWriter) -> None:
+        """Handle DISCARD command - abort a transaction"""
+        # Check if this client is in a transaction
+        if writer not in self.transactions:
+            # DISCARD without MULTI - return an error
+            writer.write(RESPProtocol.encode_error("ERR DISCARD without MULTI"))
+            return
+        
+        # Remove the transaction state for this client
+        del self.transactions[writer]
+        
+        # Return OK
+        writer.write(RESPProtocol.encode_simple_string("OK"))
