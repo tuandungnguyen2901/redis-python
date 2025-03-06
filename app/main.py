@@ -1,18 +1,34 @@
-# Uncomment this to pass the first stage
 import socket
 import asyncio
 
 async def handle_client(reader, writer):
-    pong = b"+PONG\r\n"
     addr = writer.get_extra_info("peername")
     print("Connected", addr)
     while True:
         data = await reader.read(1024)
         if not data:
             break
-        print("Data:", data.decode())
-        writer.write(pong)
+        
+        message = data.decode()
+        print("Data:", message)
+        
+        # Parse the command
+        parts = message.strip().split()
+        command = parts[0].upper() if parts else ""
+        
+        if command == "PING":
+            writer.write(b"+PONG\r\n")
+        elif command == "ECHO" and len(parts) > 1:
+            echo_arg = parts[1]
+            # Format as RESP bulk string
+            resp = f"${len(echo_arg)}\r\n{echo_arg}\r\n"
+            writer.write(resp.encode())
+        else:
+            # Default response for unknown commands
+            writer.write(b"+PONG\r\n")
+            
         await writer.drain()
+    
     print("Client disconnected")
     writer.close()
 
