@@ -118,6 +118,13 @@ async def handle_client(reader, writer):
                 elif command == "REPLCONF":
                     print(f"Received REPLCONF with args: {args}")
                     writer.write(b"+OK\r\n")
+                elif command == "PSYNC":
+                    print(f"Received PSYNC with args: {args}")
+                    # Respond with FULLRESYNC, replication ID and offset
+                    repl_id = server_config["master_replid"]
+                    offset = server_config["master_repl_offset"]
+                    response = f"+FULLRESYNC {repl_id} {offset}\r\n"
+                    writer.write(response.encode())
                 elif command == "INFO":
                     # Handle INFO command with optional section argument
                     section = args[0].lower() if args else None
