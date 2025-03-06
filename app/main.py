@@ -142,7 +142,7 @@ async def handle_client(reader, writer):
     print("Client disconnected")
     writer.close()
 
-async def connect_to_master(host: str, port: int):
+async def connect_to_master(host: str, port: int, replica_port: int):
     """Establish connection to master server"""
     try:
         reader, writer = await asyncio.open_connection(host, port)
@@ -150,15 +150,43 @@ async def connect_to_master(host: str, port: int):
         
         # Send PING to check connection
         ping_command = b"*1\r\n$4\r\nPING\r\n"
-        print(f"Sending to master: {ping_command}")
+        print(f"Sending to master: {ping_command!r}")
         writer.write(ping_command)
         await writer.drain()
         
         # Read PONG response
         response = await reader.read(1024)
-        print(f"Received from master: {response}")
+        print(f"Received from master: {response!r}")
         if not response:
             print("Failed to receive PING response from master")
+            writer.close()
+            return None, None
+            
+        # Send first REPLCONF command (listening-port)
+        port_cmd = f"*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n${len(str(replica_port))}\r\n{replica_port}\r\n"
+        print(f"Sending REPLCONF listening-port: {port_cmd!r}")
+        writer.write(port_cmd.encode())
+        await writer.drain()
+        
+        # Read OK response
+        response = await reader.read(1024)
+        print(f"Received from master: {response!r}")
+        if not response or b"+OK" not in response:
+            print("Failed to receive OK response for REPLCONF listening-port")
+            writer.close()
+            return None, None
+            
+        # Send second REPLCONF command (capa psync2)
+        capa_cmd = b"*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n"
+        print(f"Sending REPLCONF capa: {capa_cmd!r}")
+        writer.write(capa_cmd)
+        await writer.drain()
+        
+        # Read OK response
+        response = await reader.read(1024)
+        print(f"Received from master: {response!r}")
+        if not response or b"+OK" not in response:
+            print("Failed to receive OK response for REPLCONF capa")
             writer.close()
             return None, None
             
@@ -186,7 +214,11 @@ async def main():
             print(f"Running as replica of {master_host}:{master_port}")
             
             # Connect to master before starting server
-            master_reader, master_writer = await connect_to_master(master_host, int(master_port))
+            master_reader, master_writer = await connect_to_master(
+                master_host, 
+                int(master_port),
+                args.port  # Pass the replica's port
+            )
             if not master_reader or not master_writer:
                 print("Failed to establish connection with master")
                 return
