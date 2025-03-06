@@ -3,6 +3,7 @@ import asyncio
 import time
 import argparse
 from typing import Dict, Tuple, Optional
+import base64
 
 # Store both value and expiry timestamp (in ms since epoch)
 data_store: Dict[str, Tuple[str, Optional[int]]] = {}
@@ -15,6 +16,9 @@ server_config = {
     "master_replid": "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",  # Hardcoded replication ID
     "master_repl_offset": 0  # Starting offset
 }
+
+# Replace the existing EMPTY_RDB_HEX with this one
+EMPTY_RDB_HEX = "524544495330303131FE00FF77DE0394AC9D23EA"
 
 def get_current_time_ms():
     return int(time.time() * 1000)
@@ -38,6 +42,10 @@ def format_info_response(section=None):
         info_str = "\n".join(info_lines)
         return f"${len(info_str)}\r\n{info_str}\r\n"
     return "$-1\r\n"  # Return nil for unknown sections
+
+def get_empty_rdb():
+    """Return empty RDB file contents"""
+    return bytes.fromhex(EMPTY_RDB_HEX)
 
 async def handle_client(reader, writer):
     addr = writer.get_extra_info("peername")
@@ -125,6 +133,14 @@ async def handle_client(reader, writer):
                     offset = server_config["master_repl_offset"]
                     response = f"+FULLRESYNC {repl_id} {offset}\r\n"
                     writer.write(response.encode())
+                    await writer.drain()
+                    
+                    # Send empty RDB file
+                    rdb_contents = get_empty_rdb()
+                    rdb_length = len(rdb_contents)
+                    writer.write(f"${rdb_length}\r\n".encode())
+                    writer.write(rdb_contents)  # No \r\n at the end
+                    await writer.drain()
                 elif command == "INFO":
                     # Handle INFO command with optional section argument
                     section = args[0].lower() if args else None
