@@ -142,6 +142,31 @@ async def handle_client(reader, writer):
     print("Client disconnected")
     writer.close()
 
+async def connect_to_master(host: str, port: int):
+    """Establish connection to master server"""
+    try:
+        reader, writer = await asyncio.open_connection(host, port)
+        print(f"Connected to master at {host}:{port}")
+        
+        # Send PING to check connection
+        ping_command = b"*1\r\n$4\r\nPING\r\n"
+        print(f"Sending to master: {ping_command}")
+        writer.write(ping_command)
+        await writer.drain()
+        
+        # Read PONG response
+        response = await reader.read(1024)
+        print(f"Received from master: {response}")
+        if not response:
+            print("Failed to receive PING response from master")
+            writer.close()
+            return None, None
+            
+        return reader, writer
+    except Exception as e:
+        print(f"Failed to connect to master: {e}")
+        return None, None
+
 async def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Redis server implementation')
@@ -159,6 +184,13 @@ async def main():
                 "master_port": int(master_port)
             })
             print(f"Running as replica of {master_host}:{master_port}")
+            
+            # Connect to master before starting server
+            master_reader, master_writer = await connect_to_master(master_host, int(master_port))
+            if not master_reader or not master_writer:
+                print("Failed to establish connection with master")
+                return
+            
         except ValueError:
             print("Error: --replicaof argument must be in format 'host port'")
             return
@@ -166,8 +198,38 @@ async def main():
     # Start server with specified port
     server = await asyncio.start_server(handle_client, "localhost", args.port)
     print(f"Server listening on port {args.port}...")
-    async with server:
-        await server.serve_forever()
+    
+    if args.replicaof:
+        # Start both the server and master connection handling
+        async with server:
+            await asyncio.gather(
+                server.serve_forever(),
+                handle_master_connection(master_reader, master_writer)
+            )
+    else:
+        # Just run the server normally
+        async with server:
+            await server.serve_forever()
+
+async def handle_master_connection(reader, writer):
+    """Handle ongoing communication with master"""
+    try:
+        while True:
+            # Keep connection alive and handle master commands
+            data = await reader.read(1024)
+            if not data:
+                print("Master connection closed")
+                break
+            
+            # Handle master commands here (will be implemented in future stages)
+            print(f"Received from master: {data}")
+            
+    except Exception as e:
+        print(f"Error in master connection: {e}")
+    finally:
+        if not writer.is_closing():
+            writer.close()
+            await writer.wait_closed()
 
 if __name__ == "__main__":
     asyncio.run(main())
