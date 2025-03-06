@@ -466,12 +466,10 @@ class Redis:
                 await self.replication.propagate_to_replicas("INCR", key)
                 
             except ValueError:
-                # Value is not an integer - will handle this in a later stage
-                # For now, just return an error
-                writer.write(RESPProtocol.encode_error("value is not an integer or out of range"))
+                # Value is not an integer - return standard Redis error
+                writer.write(RESPProtocol.encode_error("ERR value is not an integer or out of range"))
         else:
-            # Key doesn't exist - will handle this in a later stage
-            # For now, set to 1 and return
+            # Key doesn't exist - create it with value "1"
             self.data_store[key] = ("1", None)  # No expiry
             writer.write(RESPProtocol.encode_integer(1))
             
