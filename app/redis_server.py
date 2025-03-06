@@ -176,6 +176,14 @@ class Redis:
         try:
             print(f"Executing command: {command}, args: {args}")
             
+            # List of write commands that modify data
+            write_commands = {"SET", "INCR", "DEL", "LPUSH", "RPUSH", "HSET", "SADD", "ZADD", "EXPIRE"}
+            
+            # If we're a slave and this is a write command, forward to master
+            if self.replication.role == "slave" and command in write_commands:
+                await self._forward_write_to_master(command, args, writer)
+                return
+            
             # Handle transaction-specific commands directly
             if command == "MULTI":
                 await self._handle_multi(writer)
@@ -661,3 +669,37 @@ class Redis:
                 print(f"Successfully saved data to {os.path.join(dir_path, dbfilename)}")
             else:
                 print("Failed to save RDB file")
+
+    async def _forward_write_to_master(self, command: str, args: list, writer: StreamWriter) -> None:
+        """Forward write commands to master and return response to client"""
+        # Check if we're connected to a master
+        if not self.replication.master_host or not self.replication.master_port:
+            writer.write(RESPProtocol.encode_error("READONLY You can't write against a read only replica"))
+            return
+        
+        try:
+            # Open a new connection to the master
+            reader, master_writer = await asyncio.open_connection(
+                self.replication.master_host, 
+                self.replication.master_port
+            )
+            
+            # Send the command to master
+            print(f"Forwarding {command} {args} to master")
+            cmd_bytes = RESPProtocol.encode_array([command] + args)
+            master_writer.write(cmd_bytes)
+            await master_writer.drain()
+            
+            # Wait for the response from master
+            response_data = await reader.read(4096)
+            
+            # Forward the response back to the client
+            writer.write(response_data)
+            
+            # Clean up the master connection
+            master_writer.close()
+            await master_writer.wait_closed()
+            
+        except Exception as e:
+            print(f"Error forwarding write to master: {e}")
+            writer.write(RESPProtocol.encode_error(f"ERR master connection failed: {str(e)}"))
