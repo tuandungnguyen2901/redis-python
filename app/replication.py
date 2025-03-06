@@ -32,7 +32,15 @@ class ReplicationManager:
             return
             
         try:
-            cmd_bytes = RESPProtocol.encode_array([command, *args])
+            # For INCR, we need to make sure args are properly converted to strings
+            cmd_args = [command]
+            for arg in args:
+                cmd_args.append(str(arg))
+            
+            cmd_bytes = RESPProtocol.encode_array(cmd_args)
+            
+            print(f"Propagating to replicas: {command} {args}")
+            
             for writer in self.replicas:
                 if not writer.is_closing():
                     writer.write(cmd_bytes)
@@ -182,9 +190,52 @@ class ReplicationManager:
                                     redis_instance.data_store[key] = (value, expiry)
                                     print(f"Data store after SET: {redis_instance.data_store}")
                                     
+                                    # Save to RDB after key change from master
+                                    await redis_instance._save_rdb()
+                                    
                                     # Add this command's bytes to the offset
                                     self.processed_bytes += command_length
                                     print(f"Updated processed bytes to {self.processed_bytes} after SET")
+                                elif command == "KEYS" and len(args) >= 1:
+                                    # Handle KEYS command (useful for debugging)
+                                    pattern = args[0]
+                                    matched_keys = redis_instance._get_matching_keys(pattern)
+                                    print(f"Keys matching pattern {pattern}: {matched_keys}")
+                                    
+                                    # Update processed bytes
+                                    self.processed_bytes += command_length
+                                elif command == "INCR" and len(args) >= 1:
+                                    # Handle INCR command from master
+                                    key = args[0]
+                                    
+                                    # Check if key exists and is not expired
+                                    if key in redis_instance.data_store and not redis_instance.is_key_expired(key):
+                                        value, expiry = redis_instance.data_store[key]
+                                        
+                                        try:
+                                            # Try to convert value to integer and increment
+                                            int_value = int(value)
+                                            int_value += 1
+                                            
+                                            # Store the new value (preserving expiry)
+                                            redis_instance.data_store[key] = (str(int_value), expiry)
+                                            print(f"Incremented key from master: {key} = {int_value}")
+                                            
+                                            # Save to RDB after key change from master
+                                            await redis_instance._save_rdb()
+                                        except ValueError:
+                                            print(f"Error incrementing key {key}: value is not an integer")
+                                    else:
+                                        # Key doesn't exist - create it with value "1"
+                                        redis_instance.data_store[key] = ("1", None)  # No expiry
+                                        print(f"Created new key from master INCR: {key} = 1")
+                                        
+                                        # Save to RDB after key change from master
+                                        await redis_instance._save_rdb()
+                                    
+                                    # Add this command's bytes to the offset
+                                    self.processed_bytes += command_length
+                                    print(f"Updated processed bytes to {self.processed_bytes} after INCR")
                                 else:
                                     # For any other command, just update the offset
                                     self.processed_bytes += command_length
@@ -235,7 +286,6 @@ class ReplicationManager:
                     self.replica_port = sockname[1]
                 else:
                     # If we can't get the local port, use a fixed port of 6380
-                    # This isn't ideal but better than None
                     self.replica_port = 6380
                 
             print(f"Using replica port: {self.replica_port}")
@@ -323,16 +373,20 @@ class ReplicationManager:
                 # Calculate where RDB content should end
                 rdb_content_end = rdb_content_start + rdb_length
                 
+                # Initialize a variable to collect the complete RDB data
+                complete_rdb_data = bytearray()
+                
                 # Check if REPLCONF command starts immediately after RDB
                 remaining_data = b""
                 if len(rdb_data) > rdb_content_end and rdb_data[rdb_content_end:].startswith(b"*"):
                     remaining_data = rdb_data[rdb_content_end:]
-                    rdb_content = rdb_data[rdb_content_start:rdb_content_end]
+                    complete_rdb_data.extend(rdb_data[rdb_content_start:rdb_content_end])
                 else:
-                    rdb_content = rdb_data[rdb_content_start:]
+                    # We have partial RDB data
+                    complete_rdb_data.extend(rdb_data[rdb_content_start:])
                     
                     # Continue reading RDB content if needed
-                    remaining_bytes = rdb_length - len(rdb_content)
+                    remaining_bytes = rdb_length - len(rdb_data[rdb_content_start:])
                     while remaining_bytes > 0:
                         chunk = await reader.read(min(4096, remaining_bytes))
                         if not chunk:
@@ -340,14 +394,47 @@ class ReplicationManager:
                             
                         if len(chunk) > remaining_bytes:
                             # We got more than needed, which might include commands
-                            rdb_content += chunk[:remaining_bytes]
+                            complete_rdb_data.extend(chunk[:remaining_bytes])
                             remaining_data = chunk[remaining_bytes:]
                             remaining_bytes = 0
                         else:
-                            rdb_content += chunk
+                            complete_rdb_data.extend(chunk)
                             remaining_bytes -= len(chunk)
                 
-                print(f"Received complete RDB file of length {len(rdb_content)}")
+                print(f"Received complete RDB file of length {len(complete_rdb_data)}")
+                
+                # Now that we have the complete RDB data, we need to load it into our Redis instance
+                from redis_server import Redis
+                for obj in gc.get_objects():
+                    if isinstance(obj, Redis) and obj.replication is self:
+                        redis_instance = obj
+                        break
+                
+                if redis_instance:
+                    # Create a temporary file to store the RDB data
+                    import tempfile
+                    import os
+                    
+                    # Create a temporary directory
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        temp_rdb_path = os.path.join(temp_dir, "temp.rdb")
+                        
+                        # Write the RDB data to the file
+                        with open(temp_rdb_path, 'wb') as f:
+                            f.write(complete_rdb_data)
+                        
+                        # Use the RDBParser to load the data
+                        from rdb import RDBParser
+                        parser = RDBParser()
+                        data = parser.load_rdb(temp_dir, "temp.rdb")
+                        
+                        # Update the Redis instance's data store with the loaded data
+                        redis_instance.data_store.update(data)
+                        print(f"Loaded {len(data)} keys from master's RDB snapshot")
+                        
+                        # Save the loaded data to our own RDB file
+                        await redis_instance._save_rdb()
+                        print("Saved master data to local RDB file")
                 
                 # Check for and handle REPLCONF GETACK in the remaining data
                 if remaining_data and remaining_data.startswith(b"*"):
@@ -459,6 +546,111 @@ class ReplicationManager:
                 except asyncio.TimeoutError:
                     print("No additional commands received")
                 
+                # After RDB synchronization, explicitly request all keys from master
+                # to make sure we have everything
+                print("Requesting all keys from master for verification...")
+                keys_cmd = RESPProtocol.encode_array(["KEYS", "*"])
+                writer.write(keys_cmd)
+                await writer.drain()
+                
+                # Wait a bit to make sure KEYS command is processed and any 
+                # outstanding data is received
+                await asyncio.sleep(0.5)
+                
+                # Process any data that might have been sent in response
+                try:
+                    extra_data = await asyncio.wait_for(reader.read(4096), 1.0)
+                    if extra_data:
+                        print(f"Received extra data after synchronization: {len(extra_data)} bytes")
+                        
+                        # Find Redis instance again to ensure we have the right one
+                        from redis_server import Redis
+                        redis_instance = None
+                        for obj in gc.get_objects():
+                            if isinstance(obj, Redis) and obj.replication is self:
+                                redis_instance = obj
+                                break
+                        
+                        if redis_instance:
+                            # Log current keys in our store
+                            current_keys = list(redis_instance.data_store.keys())
+                            print(f"Current keys in slave: {current_keys}")
+                            
+                            # We also want to run a verification - get all keys from master directly
+                            # through a separate connection to compare
+                            print("Connecting to master directly to verify keys...")
+                            try:
+                                verify_reader, verify_writer = await asyncio.open_connection(
+                                    self.master_host, self.master_port)
+                                
+                                # Send KEYS * command
+                                verify_writer.write(RESPProtocol.encode_array(["KEYS", "*"]))
+                                await verify_writer.drain()
+                                
+                                # Read the response - this will be an array of keys
+                                response_data = await verify_reader.read(4096)
+                                print(f"Verification data received: {len(response_data)} bytes")
+                                
+                                # Parse array response to extract keys
+                                master_keys = []
+                                
+                                # Simple parsing of RESP array
+                                if response_data.startswith(b"*"):
+                                    try:
+                                        lines = response_data.split(b"\r\n")
+                                        array_size = int(lines[0][1:])
+                                        print(f"Master has {array_size} keys")
+                                        
+                                        # Extract each key
+                                        index = 1
+                                        for i in range(array_size):
+                                            if index + 1 < len(lines) and lines[index].startswith(b"$"):
+                                                key = lines[index+1].decode("utf-8")
+                                                master_keys.append(key)
+                                                index += 2
+                                    except Exception as e:
+                                        print(f"Error parsing verification response: {e}")
+                                
+                                print(f"Master keys: {master_keys}")
+                                
+                                # For any keys in master that aren't in slave, get their values
+                                missing_keys = [k for k in master_keys if k not in current_keys]
+                                print(f"Keys missing in slave: {missing_keys}")
+                                
+                                # Fetch and set each missing key
+                                for key in missing_keys:
+                                    verify_writer.write(RESPProtocol.encode_array(["GET", key]))
+                                    await verify_writer.drain()
+                                    
+                                    # Simple read for the GET response
+                                    get_response = await verify_reader.read(1024)
+                                    
+                                    if get_response.startswith(b"$"):
+                                        # It's a bulk string response
+                                        lines = get_response.split(b"\r\n")
+                                        if len(lines) >= 2 and lines[0].startswith(b"$"):
+                                            value_len = int(lines[0][1:])
+                                            if value_len > 0:
+                                                value = lines[1].decode("utf-8")
+                                                # Store it in our data store
+                                                redis_instance.data_store[key] = (value, None)
+                                                print(f"Added missing key: {key} = {value}")
+                                
+                                # After adding all missing keys, save to RDB
+                                if missing_keys:
+                                    await redis_instance._save_rdb()
+                                    print("Saved missing keys to local RDB file")
+                                
+                                # Clean up verification connection
+                                verify_writer.close()
+                                await verify_writer.wait_closed()
+                                
+                            except Exception as e:
+                                print(f"Error in key verification: {e}")
+                except asyncio.TimeoutError:
+                    print("No extra data received after synchronization.")
+                
+                print("Master-slave synchronization complete!")
                 return reader, writer
                 
             except (ValueError, IndexError) as e:

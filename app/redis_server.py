@@ -357,6 +357,9 @@ class Redis:
         self.data_store[key] = (value, expiry)
         writer.write(RESPProtocol.encode_simple_string("OK"))
         
+        # Save to RDB after key change
+        await self._save_rdb()
+        
         await self.replication.propagate_to_replicas("SET", key, value, *args[2:])
         
     async def _handle_get(self, args: list, writer: StreamWriter) -> None:
@@ -479,6 +482,9 @@ class Redis:
                 # Store the new value (preserving expiry)
                 self.data_store[key] = (str(int_value), expiry)
                 
+                # Save to RDB after key change
+                await self._save_rdb()
+                
                 # Return the new value as an integer response
                 writer.write(RESPProtocol.encode_integer(int_value))
                 
@@ -491,6 +497,10 @@ class Redis:
         else:
             # Key doesn't exist - create it with value "1"
             self.data_store[key] = ("1", None)  # No expiry
+            
+            # Save to RDB after key change
+            await self._save_rdb()
+            
             writer.write(RESPProtocol.encode_integer(1))
             
             # Propagate to replicas if any
@@ -560,6 +570,9 @@ class Redis:
                     
                 self.data_store[key] = (value, expiry)
                 
+                # Save to RDB after key change
+                await self._save_rdb()
+                
                 # Propagate to replicas after executing the command
                 await self.replication.propagate_to_replicas("SET", key, value, *args[2:])
                 
@@ -595,6 +608,9 @@ class Redis:
                         
                         self.data_store[key] = (str(int_value), expiry)
                         
+                        # Save to RDB after key change
+                        await self._save_rdb()
+                        
                         # Propagate to replicas
                         await self.replication.propagate_to_replicas("INCR", key)
                         
@@ -604,6 +620,9 @@ class Redis:
                         return RESPProtocol.encode_error("ERR value is not an integer or out of range")
                 else:
                     self.data_store[key] = ("1", None)
+                    
+                    # Save to RDB after key change
+                    await self._save_rdb()
                     
                     # Propagate to replicas
                     await self.replication.propagate_to_replicas("INCR", key)
@@ -629,3 +648,16 @@ class Redis:
         
         # Return OK
         writer.write(RESPProtocol.encode_simple_string("OK"))
+
+    async def _save_rdb(self) -> None:
+        """Save the current data store to RDB file"""
+        dir_path = self.config.get("dir")
+        dbfilename = self.config.get("dbfilename")
+        
+        if dir_path and dbfilename:
+            parser = RDBParser()
+            success = parser.save_rdb(dir_path, dbfilename, self.data_store)
+            if success:
+                print(f"Successfully saved data to {os.path.join(dir_path, dbfilename)}")
+            else:
+                print("Failed to save RDB file")
