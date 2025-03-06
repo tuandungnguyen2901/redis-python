@@ -589,6 +589,7 @@ class Redis:
                     value, expiry = self.data_store[key]
                     
                     try:
+                        # This will raise ValueError if value is not an integer
                         int_value = int(value)
                         int_value += 1
                         
@@ -599,6 +600,7 @@ class Redis:
                         
                         return RESPProtocol.encode_integer(int_value)
                     except ValueError:
+                        # This is the error we'll see when trying to increment "abc"
                         return RESPProtocol.encode_error("ERR value is not an integer or out of range")
                 else:
                     self.data_store[key] = ("1", None)
