@@ -133,7 +133,13 @@ class ReplicationManager:
                             print(f"Processing master command: {command} {args}")
                             
                             # Execute the command on replica
-                            if command == "SET" and len(args) >= 2:
+                            if command == "REPLCONF" and len(args) >= 2 and args[0].upper() == "GETACK":
+                                print("Received REPLCONF GETACK, sending ACK")
+                                # Send REPLCONF ACK 0 response
+                                ack_response = RESPProtocol.encode_array(["REPLCONF", "ACK", "0"])
+                                writer.write(ack_response)
+                                await writer.drain()
+                            elif command == "SET" and len(args) >= 2:
                                 key, value = args[0], args[1]
                                 expiry = None
                                 
