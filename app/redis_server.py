@@ -504,6 +504,13 @@ class Redis:
             writer.write(RESPProtocol.encode_error("ERR EXEC without MULTI"))
             return
         
-        # Transaction execution will be implemented in a later stage
-        # For now, just return some placeholder response
-        # (This part should not be reached in this test stage)
+        # Get the transaction data
+        transaction = self.transactions[writer]
+        queued_commands = transaction.get("commands", [])
+        
+        # For now, we just handle empty transactions
+        # Return an empty array response
+        writer.write(b"*0\r\n")
+        
+        # Remove the transaction state for this client
+        del self.transactions[writer]
