@@ -373,112 +373,20 @@ class Redis:
             
     def _get_value_from_rdb(self, dir_path: str, dbfilename: str, target_key: str) -> Optional[str]:
         """Extract a specific key's value directly from the RDB file"""
-        rdb_file_path = os.path.join(dir_path, dbfilename)
-        if not os.path.exists(rdb_file_path):
-            return None
+        # We'll directly use our RDBParser to get the value
+        parser = RDBParser()
+        data = parser.load_rdb(dir_path, dbfilename)
         
-        try:
-            with open(rdb_file_path, "rb") as rdb_file:
-                rdb_content = rdb_file.read()
-                
-            # Quick check for test cases with 'orange' as key
-            if target_key == 'orange' and b'orange' in rdb_content and b'grape' in rdb_content:
-                return 'grape'
-                
-            # Convert bytes to hex string for easier parsing
-            hex_content = rdb_content.hex()
+        if target_key in data:
+            value, expiry = data[target_key]
             
-            # Find OPCODE_RESIZEDB (fb) which indicates the start of the database
-            resizedb_pos = hex_content.find("fb")
-            if resizedb_pos <= 0:
-                return None
-                
-            # Find the key in the RDB file
-            # Start after RESIZEDB
-            pos = resizedb_pos + 6  # Skip past opcode and resize info
+            # Check if the key is expired
+            if expiry is not None and self.get_current_time_ms() >= expiry:
+                return None  # Key is expired
             
-            while pos < len(hex_content):
-                # Look for a string type indicator (00 for STRING)
-                type_pos = pos
-                if type_pos + 2 >= len(hex_content):
-                    break
-                    
-                # Read value type
-                value_type = int(hex_content[type_pos:type_pos+2], 16)
-                pos = type_pos + 2
-                
-                # Check if we've reached the end of the RDB file
-                if value_type == 0xff:  # EOF
-                    break
-                    
-                # Read key length
-                if pos + 2 >= len(hex_content):
-                    break
-                    
-                key_len_byte = int(hex_content[pos:pos+2], 16)
-                pos += 2
-                
-                # Simple length encoding (6 bits)
-                if key_len_byte < 0x40:  # Length < 64 bytes
-                    key_len = key_len_byte
-                    
-                    # Read key
-                    if pos + key_len*2 > len(hex_content):
-                        break
-                        
-                    key_hex = hex_content[pos:pos+key_len*2]
-                    pos += key_len*2
-                    
-                    try:
-                        key = bytes.fromhex(key_hex).decode('utf-8')
-                        
-                        # If this is the key we're looking for
-                        if key == target_key:
-                            # Read value length
-                            if pos + 2 >= len(hex_content):
-                                break
-                                
-                            val_len_byte = int(hex_content[pos:pos+2], 16)
-                            pos += 2
-                            
-                            # Simple length encoding
-                            if val_len_byte < 0x40:
-                                val_len = val_len_byte
-                                
-                                # Read value
-                                if pos + val_len*2 > len(hex_content):
-                                    break
-                                    
-                                val_hex = hex_content[pos:pos+val_len*2]
-                                try:
-                                    value = bytes.fromhex(val_hex).decode('utf-8')
-                                    return value
-                                except:
-                                    # If we can't decode the value, return a placeholder for the test
-                                    if "/tmp/rdbfiles" in dir_path:
-                                        return "grape"  # Hardcoded for test case
-                            else:
-                                # For test case
-                                if "/tmp/rdbfiles" in dir_path:
-                                    return "grape"  # Hardcoded for test case
-                    except:
-                        pass
-                    
-                # Skip to next entry
-                pos += 2  # Move forward a bit to look for next entry
-                
-            # If key not found and we're in test directory
-            if "/tmp/rdbfiles" in dir_path:
-                # For test case with 'orange' key
-                if target_key == 'orange':
-                    return "grape"  # Hardcoded value for test case
-                
-        except Exception as e:
-            print(f"Error extracting value from RDB: {e}")
-            import traceback
-            traceback.print_exc()
-            
-        return None
+            return value
+        
+        return None  # Key not found
         
     async def start(self) -> None:
         if self.replication.role == "slave":
@@ -503,56 +411,28 @@ class Redis:
     def _get_matching_keys(self, pattern: str) -> List[str]:
         """Get keys that match the specified pattern (supporting glob-style pattern)"""
         if pattern == "*":
+            # First, check if we need to reload data from RDB
             dir_path = self.config.get("dir")
             dbfilename = self.config.get("dbfilename")
             
-            if dir_path and dbfilename:
-                rdb_file_path = os.path.join(dir_path, dbfilename)
-                if os.path.exists(rdb_file_path):
-                    with open(rdb_file_path, "rb") as rdb_file:
-                        rdb_content = rdb_file.read()
-                        # Convert bytes to hex string for easier parsing
-                        hex_content = rdb_content.hex()
-                        
-                        # Look for OPCODE_RESIZEDB (fb) which indicates the start of the database
-                        resizedb_pos = hex_content.find("fb")
-                        if resizedb_pos > 0:
-                            # Skip past the resize info to find the first key
-                            # We're looking for a pattern that represents a string key
-                            # This is a simplified approach for the specific test case
-                            key_start = resizedb_pos + 8  # Approximate position after resizedb
-                            
-                            # Find the next readable string after this position (the key)
-                            for i in range(key_start, len(hex_content), 2):
-                                # Look for a string marker (a byte followed by readable ASCII)
-                                if i+2 < len(hex_content):
-                                    try:
-                                        byte_val = int(hex_content[i:i+2], 16)
-                                        # Check if this looks like a string length
-                                        if 1 <= byte_val <= 20:  # Assume keys are short
-                                            # Try to decode the following bytes as a key
-                                            potential_key_len = byte_val * 2  # Each char is 2 hex digits
-                                            if i+2+potential_key_len <= len(hex_content):
-                                                key_hex = hex_content[i+2:i+2+potential_key_len]
-                                                try:
-                                                    key = bytes.fromhex(key_hex).decode('utf-8')
-                                                    if key.isalnum():  # Simple validation
-                                                        print(f"Found key: {key}")
-                                                        return [key]
-                                                except:
-                                                    pass
-                                    except:
-                                        pass
+            # If we don't have keys in memory, try to (re)load from RDB
+            if not self.data_store and dir_path and dbfilename:
+                self._load_from_rdb()
+            
+            # Return all keys that are not expired
+            return [key for key in self.data_store.keys() if not self.is_key_expired(key)]
         
-            # If our simplified parsing fails, fall back to the data_store keys
-            keys = [key for key in self.data_store.keys() if not self.is_key_expired(key)]
-            if keys:
-                return keys
-            
-            # The RDB file might have a specific format that our simple parser can't handle
-            # For the test case, return "orange" if we're in the test directory
-            if dir_path and "/tmp/rdbfiles" in dir_path:
-                return ["orange"]
-            
-        # If pattern is not "*" or no keys found
+        # If we're looking for specific patterns (not just "*")
+        elif "?" in pattern or "[" in pattern:
+            # TODO: Implement proper glob pattern matching
+            # For now, just return any keys that match the prefix
+            prefix = pattern.split("?")[0].split("[")[0]
+            return [key for key in self.data_store.keys() 
+                    if key.startswith(prefix) and not self.is_key_expired(key)]
+        
+        # Exact key match
+        elif pattern in self.data_store and not self.is_key_expired(pattern):
+            return [pattern]
+        
+        # No matches
         return []
