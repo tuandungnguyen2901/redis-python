@@ -16,6 +16,9 @@ class Redis:
         self.replication = ReplicationManager()
         self.config = Config()
         
+        # Track transactions by client connection
+        self.transactions: Dict[StreamWriter, Dict] = {}
+        
         # Set the replica port in the replication manager
         self.replication.replica_port = port
         
@@ -161,6 +164,10 @@ class Redis:
             await writer.drain()
             
         print("Client disconnected")
+        # Clean up transaction state for this client
+        if writer in self.transactions:
+            del self.transactions[writer]
+        
         writer.close()
         self.replication.cleanup_replicas()
         
@@ -169,7 +176,10 @@ class Redis:
         try:
             print(f"Executing command: {command}, args: {args}")
             
-            if command == "PING":
+            # Add MULTI command handling
+            if command == "MULTI":
+                await self._handle_multi(writer)
+            elif command == "PING":
                 writer.write(b"+PONG\r\n")
             elif command == "ECHO" and args:
                 writer.write(RESPProtocol.encode_bulk_string(args[0]))
@@ -475,3 +485,11 @@ class Redis:
             
             # Propagate to replicas if any
             await self.replication.propagate_to_replicas("INCR", key)
+
+    async def _handle_multi(self, writer: StreamWriter) -> None:
+        """Handle MULTI command - start a transaction"""
+        # Add writer to the set of connections in a transaction
+        self.transactions[writer] = {"commands": []}
+        
+        # Return simple string OK
+        writer.write(RESPProtocol.encode_simple_string("OK"))
