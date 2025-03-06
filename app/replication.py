@@ -1,4 +1,4 @@
-from typing import Set, Optional, Tuple
+from typing import Set, Optional, Tuple, List
 from asyncio import StreamWriter, StreamReader
 import asyncio
 from resp import RESPProtocol
@@ -17,6 +17,8 @@ class ReplicationManager:
         self.replica_port: Optional[int] = None
         self.master_replid: str = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"
         self.master_repl_offset: int = 0
+        # Add a counter to track bytes processed from master
+        self.processed_bytes: int = 0
     
     def get_empty_rdb(self) -> bytes:
         """Return empty RDB file contents"""
@@ -134,16 +136,25 @@ class ReplicationManager:
                             for i in range(expected_crlf):
                                 cmd_end = buffer.find(b"\r\n", cmd_end) + 2
                             
+                            # Get the actual command bytes for offset tracking
+                            command_bytes = buffer[:cmd_end]
+                            command_length = len(command_bytes)
+                            
                             # Process the command
                             if command:
                                 print(f"Processing master command: {command} {args}")
                                 
                                 # Execute the command on replica
                                 if command == "REPLCONF" and len(args) >= 2 and args[0].upper() == "GETACK":
-                                    print("Received REPLCONF GETACK, sending ACK")
-                                    ack_response = RESPProtocol.encode_array(["REPLCONF", "ACK", "0"])
+                                    # For GETACK, respond with current offset but don't add command to offset yet
+                                    print(f"Received REPLCONF GETACK, sending ACK with offset {self.processed_bytes}")
+                                    ack_response = RESPProtocol.encode_array(["REPLCONF", "ACK", str(self.processed_bytes)])
                                     writer.write(ack_response)
                                     await writer.drain()
+                                    
+                                    # After responding, add this command's bytes to the offset
+                                    self.processed_bytes += command_length
+                                    print(f"Updated processed bytes to {self.processed_bytes} after GETACK")
                                 elif command == "SET" and len(args) >= 2:
                                     key, value = args[0], args[1]
                                     expiry = None
@@ -160,6 +171,15 @@ class ReplicationManager:
                                     print(f"Setting key from master: {key} = {value}")
                                     redis_instance.data_store[key] = (value, expiry)
                                     print(f"Data store after SET: {redis_instance.data_store}")
+                                    
+                                    # Add this command's bytes to the offset
+                                    self.processed_bytes += command_length
+                                    print(f"Updated processed bytes to {self.processed_bytes} after SET")
+                                else:
+                                    # For any other command, just update the offset
+                                    self.processed_bytes += command_length
+                                    print(f"Updated processed bytes to {self.processed_bytes} after {command}")
+                                
                                 # Add other command handlers as needed
                                 
                             # Remove the processed command from buffer
@@ -306,37 +326,114 @@ class ReplicationManager:
                 print(f"Received complete RDB file of length {len(rdb_content)}")
                 
                 # Check for and handle REPLCONF GETACK in the remaining data
-                if remaining_data and remaining_data.startswith(b"*3\r\n$8\r\nREPLCONF"):
+                if remaining_data and remaining_data.startswith(b"*"):
                     print(f"Found command after RDB: {remaining_data}")
-                    if b"GETACK" in remaining_data:
-                        print("Handling REPLCONF GETACK command")
-                        ack_response = RESPProtocol.encode_array(["REPLCONF", "ACK", "0"])
-                        writer.write(ack_response)
-                        await writer.drain()
-                else:
-                    # Check for additional commands that might arrive separately
-                    try:
-                        cmd_data = await asyncio.wait_for(reader.read(1024), 0.1)
-                        if cmd_data and cmd_data.startswith(b"*3\r\n$8\r\nREPLCONF"):
-                            print(f"Received command after RDB: {cmd_data}")
-                            if b"GETACK" in cmd_data:
-                                print("Handling REPLCONF GETACK command")
+                    
+                    # Process the initial command(s) in the remaining data
+                    cmd_end = self.find_command_end(remaining_data)
+                    if cmd_end > 0:
+                        initial_cmd = remaining_data[:cmd_end]
+                        
+                        # Check if it's a REPLCONF GETACK command
+                        if b"REPLCONF" in initial_cmd and b"GETACK" in initial_cmd:
+                            print("Handling initial REPLCONF GETACK command")
+                            
+                            # For the very first GETACK after RDB, respond with 0
+                            ack_response = RESPProtocol.encode_array(["REPLCONF", "ACK", "0"])
+                            writer.write(ack_response)
+                            await writer.drain()
+                            
+                            # Add the command bytes to the processed_bytes counter
+                            self.processed_bytes = len(initial_cmd)
+                            print(f"Initialized processed bytes to {self.processed_bytes}")
+                            
+                            # Remove the processed command from remaining data
+                            remaining_data = remaining_data[cmd_end:]
+                
+                # Process remaining data from RDB response
+                if remaining_data:
+                    print(f"Found command data after RDB: {remaining_data}")
+                    
+                    # Process all complete commands in the remaining data
+                    while remaining_data.startswith(b"*"):
+                        cmd_end = self.find_command_end(remaining_data)
+                        if cmd_end == 0:
+                            break  # Incomplete command
+                        
+                        command_data = remaining_data[:cmd_end]
+                        
+                        # Parse the command
+                        try:
+                            command, args = self.parse_command_bytes(command_data)
+                            print(f"Parsed command after RDB: {command} {args}")
+                            
+                            # Handle the command
+                            if command == "REPLCONF" and len(args) >= 2 and args[0].upper() == "GETACK":
+                                # For the first GETACK, respond with 0
+                                print("Handling REPLCONF GETACK command after RDB")
                                 ack_response = RESPProtocol.encode_array(["REPLCONF", "ACK", "0"])
                                 writer.write(ack_response)
                                 await writer.drain()
-                    except asyncio.TimeoutError:
-                        # No immediate command, that's fine
-                        pass
+                            
+                            # Track processed bytes for all commands
+                            self.processed_bytes += len(command_data)
+                            print(f"Updated processed bytes to {self.processed_bytes} after {command}")
+                            
+                        except Exception as e:
+                            print(f"Error parsing command: {e}")
+                        
+                        # Move to next command
+                        remaining_data = remaining_data[cmd_end:]
                 
-                # After receiving the RDB file, wait just a moment to ensure we're ready for commands
-                await asyncio.sleep(0.1)
-                
-                # Clear any data that might be in the reader buffer
+                # Try to read more commands if needed
                 try:
-                    reader._buffer.clear()  # Reset the reader buffer
-                except:
-                    # If this fails, it's not critical
-                    pass
+                    cmd_data = await asyncio.wait_for(reader.read(1024), 0.2)
+                    if cmd_data:
+                        print(f"Received additional command data: {cmd_data}")
+                        
+                        # Process the data the same way as the remaining data
+                        pos = 0
+                        while pos < len(cmd_data):
+                            if not cmd_data[pos:].startswith(b"*"):
+                                break
+                            
+                            # Find end of this command
+                            cmd_end = self.find_command_end(cmd_data[pos:])
+                            if cmd_end == 0:
+                                break  # Incomplete command
+                            
+                            command_bytes = cmd_data[pos:pos+cmd_end]
+                            
+                            # Parse and handle command
+                            try:
+                                command, args = self.parse_command_bytes(command_bytes)
+                                print(f"Parsed additional command: {command} {args}")
+                                
+                                if command == "PING":
+                                    print("Received PING from master")
+                                    self.processed_bytes += len(command_bytes)
+                                    print(f"Updated processed bytes to {self.processed_bytes} after PING")
+                                elif command == "REPLCONF" and len(args) >= 2 and args[0].upper() == "GETACK":
+                                    print(f"Received REPLCONF GETACK, responding with offset {self.processed_bytes}")
+                                    ack_response = RESPProtocol.encode_array(["REPLCONF", "ACK", str(self.processed_bytes)])
+                                    writer.write(ack_response)
+                                    await writer.drain()
+                                    
+                                    # After responding, add this command's bytes to the processed bytes
+                                    self.processed_bytes += len(command_bytes)
+                                    print(f"Updated processed bytes to {self.processed_bytes} after GETACK")
+                                else:
+                                    # Process any other command
+                                    self.processed_bytes += len(command_bytes)
+                                    print(f"Updated processed bytes to {self.processed_bytes} after {command}")
+                                
+                            except Exception as e:
+                                print(f"Error parsing additional command: {e}")
+                            
+                            # Move to next command
+                            pos += cmd_end
+                except asyncio.TimeoutError:
+                    print("No additional commands received")
                 
                 return reader, writer
                 
@@ -378,3 +475,61 @@ class ReplicationManager:
     def cleanup_replicas(self) -> None:
         """Remove closed connections from replicas set"""
         self.replicas = {w for w in self.replicas if not w.is_closing()} 
+
+    def find_command_end(self, buffer: bytes) -> int:
+        """Find the end position of a complete RESP command in the buffer"""
+        if not buffer.startswith(b"*"):
+            # Not a RESP array
+            return 0
+        
+        try:
+            # Find array length
+            first_line_end = buffer.find(b"\r\n")
+            if first_line_end == -1:
+                return 0  # Incomplete command
+            
+            array_length = int(buffer[1:first_line_end])
+            
+            # Expected number of \r\n pairs
+            expected_crlf = 1 + (array_length * 2)  # 1 for array marker, 2 per item
+            
+            # Find all \r\n occurrences
+            pos = 0
+            for _ in range(expected_crlf):
+                pos = buffer.find(b"\r\n", pos)
+                if pos == -1:
+                    return 0  # Incomplete command
+                pos += 2
+            
+            return pos  # End position of the command
+            
+        except (ValueError, IndexError):
+            # Invalid format
+            return 0 
+
+    def parse_command_bytes(self, data: bytes) -> Tuple[str, List[str]]:
+        """Parse a RESP command from bytes"""
+        command = None
+        args = []
+        
+        try:
+            lines = data.split(b"\r\n")
+            array_length = int(lines[0][1:])  # Skip the * in *3
+            
+            idx = 1
+            for i in range(array_length):
+                if idx < len(lines) and lines[idx].startswith(b"$"):
+                    # Skip the length line
+                    idx += 1
+                    
+                    if idx < len(lines):
+                        value = lines[idx].decode("utf-8")
+                        if i == 0:
+                            command = value.upper()
+                        else:
+                            args.append(value)
+                    idx += 1
+        except Exception as e:
+            print(f"Error parsing command bytes: {e}")
+        
+        return command, args 
