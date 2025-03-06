@@ -7,6 +7,13 @@ from typing import Dict, Tuple, Optional
 # Store both value and expiry timestamp (in ms since epoch)
 data_store: Dict[str, Tuple[str, Optional[int]]] = {}
 
+# Server configuration
+server_config = {
+    "role": "master",
+    "master_host": None,
+    "master_port": None
+}
+
 def get_current_time_ms():
     return int(time.time() * 1000)
 
@@ -21,7 +28,7 @@ def is_key_expired(key):
 def format_info_response(section=None):
     """Format INFO response according to RESP protocol"""
     if section == "replication":
-        info_str = "role:master"  # For now, we're always a master
+        info_str = f"role:{server_config['role']}"
         return f"${len(info_str)}\r\n{info_str}\r\n"
     return "$-1\r\n"  # Return nil for unknown sections
 
@@ -132,7 +139,22 @@ async def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Redis server implementation')
     parser.add_argument('--port', type=int, default=6379, help='Port to listen on')
+    parser.add_argument('--replicaof', type=str, help='Master host and port (e.g. "localhost 6379")')
     args = parser.parse_args()
+    
+    # Configure server role based on --replicaof flag
+    if args.replicaof:
+        try:
+            master_host, master_port = args.replicaof.split()
+            server_config.update({
+                "role": "slave",
+                "master_host": master_host,
+                "master_port": int(master_port)
+            })
+            print(f"Running as replica of {master_host}:{master_port}")
+        except ValueError:
+            print("Error: --replicaof argument must be in format 'host port'")
+            return
     
     # Start server with specified port
     server = await asyncio.start_server(handle_client, "localhost", args.port)
