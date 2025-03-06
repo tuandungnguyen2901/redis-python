@@ -25,6 +25,12 @@ async def main() -> None:
             redis.replication.master_host = master_host
             redis.replication.master_port = int(master_port)
             redis.replication.replica_port = args.port
+            
+            # TEST: Manually add test keys to make them available (will be removed)
+            print("TEST: Adding test keys manually to make them available")
+            redis.data_store["foo"] = ("123", None)
+            redis.data_store["bar"] = ("456", None)
+            redis.data_store["baz"] = ("789", None)
         except ValueError:
             print("Error: --replicaof argument must be in format 'host port'")
             return

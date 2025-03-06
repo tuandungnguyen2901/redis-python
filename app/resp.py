@@ -20,10 +20,18 @@ class RESPProtocol:
     
     @staticmethod
     def encode_bulk_string(value: Optional[str]) -> bytes:
-        """Encode bulk string: $4\r\nBULK\r\n"""
+        """Encode a bulk string in RESP format"""
         if value is None:
-            return b"$-1\r\n"
-        return f"${len(value)}\r\n{value}\r\n".encode()
+            return b"$-1\r\n"  # Null bulk string
+        
+        # First encode the value to bytes
+        value_bytes = value.encode('utf-8')
+        
+        # Then construct the full response
+        length_part = f"${len(value_bytes)}\r\n".encode('utf-8')
+        
+        # Concatenate parts with proper line endings
+        return length_part + value_bytes + b"\r\n"
     
     @staticmethod
     def encode_array(value: List[str]) -> bytes:

@@ -190,16 +190,26 @@ class Redis:
         await self.replication.propagate_to_replicas("SET", key, value, *args[2:])
         
     async def _handle_get(self, args: list, writer: StreamWriter) -> None:
-        if len(args) >= 1:
+        """Handle GET command"""
+        if len(args) == 1:
             key = args[0]
-            if key in self.data_store and not self.is_key_expired(key):
-                value, _ = self.data_store[key]
-                writer.write(RESPProtocol.encode_bulk_string(value))
+            
+            # Check if key exists
+            if key in self.data_store:
+                # Check for expiration
+                if self.is_key_expired(key):
+                    del self.data_store[key]  # Delete expired key
+                    writer.write(RESPProtocol.encode_bulk_string(None))  # Return nil for expired key
+                else:
+                    # Return the value (not expired)
+                    value, _ = self.data_store[key]
+                    print(f"GET {key} returning value: {value}")
+                    writer.write(RESPProtocol.encode_bulk_string(value))
             else:
-                if key in self.data_store and self.is_key_expired(key):
-                    del self.data_store[key]
+                # Key doesn't exist
                 writer.write(RESPProtocol.encode_bulk_string(None))
         else:
+            # Wrong number of arguments
             writer.write(RESPProtocol.encode_error("wrong number of arguments for 'get' command"))
             
     async def start(self) -> None:
