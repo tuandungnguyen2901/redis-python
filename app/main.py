@@ -1,9 +1,11 @@
 import socket
 import asyncio
 import time
+import argparse
+from typing import Dict, Tuple, Optional
 
 # Store both value and expiry timestamp (in ms since epoch)
-data_store = {}
+data_store: Dict[str, Tuple[str, Optional[int]]] = {}
 
 def get_current_time_ms():
     return int(time.time() * 1000)
@@ -117,11 +119,16 @@ async def handle_client(reader, writer):
     writer.close()
 
 async def main():
-    server = await asyncio.start_server(handle_client, "localhost", 6379)
-    print("Server listening on port 6379...")
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Redis server implementation')
+    parser.add_argument('--port', type=int, default=6379, help='Port to listen on')
+    args = parser.parse_args()
+    
+    # Start server with specified port
+    server = await asyncio.start_server(handle_client, "localhost", args.port)
+    print(f"Server listening on port {args.port}...")
     async with server:
         await server.serve_forever()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
