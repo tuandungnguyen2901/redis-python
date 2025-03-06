@@ -18,6 +18,13 @@ def is_key_expired(key):
         return False
     return get_current_time_ms() >= expiry
 
+def format_info_response(section=None):
+    """Format INFO response according to RESP protocol"""
+    if section == "replication":
+        info_str = "role:master"  # For now, we're always a master
+        return f"${len(info_str)}\r\n{info_str}\r\n"
+    return "$-1\r\n"  # Return nil for unknown sections
+
 async def handle_client(reader, writer):
     addr = writer.get_extra_info("peername")
     print("Connected", addr)
@@ -74,7 +81,11 @@ async def handle_client(reader, writer):
                 resp = f"${len(echo_arg)}\r\n{echo_arg}\r\n"
                 writer.write(resp.encode())
                 print(f"Sending ECHO response: {resp}")
-            # Updated SET command handler with PX support
+            elif command == "INFO":
+                # Handle INFO command with optional section argument
+                section = args[0].lower() if args else None
+                resp = format_info_response(section)
+                writer.write(resp.encode())
             elif command == "SET" and len(args) >= 2:
                 key, value = args[0], args[1]
                 expiry = None
@@ -90,7 +101,6 @@ async def handle_client(reader, writer):
                 
                 data_store[key] = (value, expiry)
                 writer.write(b"+OK\r\n")
-            # Updated GET command handler with expiry check
             elif command == "GET":
                 if len(args) >= 1:
                     key = args[0]
