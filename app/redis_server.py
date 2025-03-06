@@ -179,6 +179,8 @@ class Redis:
             # Add MULTI command handling
             if command == "MULTI":
                 await self._handle_multi(writer)
+            elif command == "EXEC":
+                await self._handle_exec(writer)
             elif command == "PING":
                 writer.write(b"+PONG\r\n")
             elif command == "ECHO" and args:
@@ -493,3 +495,15 @@ class Redis:
         
         # Return simple string OK
         writer.write(RESPProtocol.encode_simple_string("OK"))
+
+    async def _handle_exec(self, writer: StreamWriter) -> None:
+        """Handle EXEC command - execute all queued commands in a transaction"""
+        # Check if this client is in a transaction
+        if writer not in self.transactions:
+            # EXEC without MULTI - return an error
+            writer.write(RESPProtocol.encode_error("ERR EXEC without MULTI"))
+            return
+        
+        # Transaction execution will be implemented in a later stage
+        # For now, just return some placeholder response
+        # (This part should not be reached in this test stage)
