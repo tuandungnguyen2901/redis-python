@@ -15,7 +15,7 @@ class RESPProtocol:
     
     @staticmethod
     def encode_integer(value: int) -> bytes:
-        """Encode integer: :1000\r\n"""
+        """Encode an integer value in RESP format"""
         return f":{value}\r\n".encode()
     
     @staticmethod

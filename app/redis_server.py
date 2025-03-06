@@ -184,6 +184,8 @@ class Redis:
                 await self._handle_set(args, writer)
             elif command == "GET":
                 await self._handle_get(args, writer)
+            elif command == "INCR":
+                await self._handle_incr(args, writer)
             elif command == "CONFIG" and len(args) >= 2 and args[0].upper() == "GET":
                 # Handle CONFIG GET command
                 if len(args) < 2:
@@ -436,3 +438,42 @@ class Redis:
         
         # No matches
         return []
+
+    async def _handle_incr(self, args: list, writer: StreamWriter) -> None:
+        """Handle INCR command - increment the value stored at key by 1"""
+        if len(args) != 1:
+            writer.write(RESPProtocol.encode_error("wrong number of arguments for 'incr' command"))
+            return
+        
+        key = args[0]
+        
+        # Check if key exists and is not expired
+        if key in self.data_store and not self.is_key_expired(key):
+            value, expiry = self.data_store[key]
+            
+            try:
+                # Try to convert value to integer and increment
+                int_value = int(value)
+                int_value += 1
+                
+                # Store the new value (preserving expiry)
+                self.data_store[key] = (str(int_value), expiry)
+                
+                # Return the new value as an integer response
+                writer.write(RESPProtocol.encode_integer(int_value))
+                
+                # Propagate to replicas if any
+                await self.replication.propagate_to_replicas("INCR", key)
+                
+            except ValueError:
+                # Value is not an integer - will handle this in a later stage
+                # For now, just return an error
+                writer.write(RESPProtocol.encode_error("value is not an integer or out of range"))
+        else:
+            # Key doesn't exist - will handle this in a later stage
+            # For now, set to 1 and return
+            self.data_store[key] = ("1", None)  # No expiry
+            writer.write(RESPProtocol.encode_integer(1))
+            
+            # Propagate to replicas if any
+            await self.replication.propagate_to_replicas("INCR", key)
