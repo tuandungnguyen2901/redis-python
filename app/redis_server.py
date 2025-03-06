@@ -163,9 +163,16 @@ class Redis:
             elif command == "GET":
                 await self._handle_get(args, writer)
             elif command == "WAIT":
-                # Handle WAIT command (for replication acknowledgement)
-                # For now, just return 0 as specified in the requirements
-                writer.write(RESPProtocol.encode_integer(0))
+                # Get the current number of connected replicas
+                replica_count = len(self.replication.replicas)
+                print(f"WAIT command received. Currently {replica_count} replicas connected.")
+                
+                # First clean up any closed connections
+                self.replication.cleanup_replicas()
+                
+                # Return the actual count of connected replicas
+                replica_count = len(self.replication.replicas)
+                writer.write(RESPProtocol.encode_integer(replica_count))
             else:
                 writer.write(RESPProtocol.encode_error("unknown command"))
             
