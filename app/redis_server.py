@@ -176,11 +176,17 @@ class Redis:
         try:
             print(f"Executing command: {command}, args: {args}")
             
-            # Add MULTI command handling
+            # Handle transaction-specific commands directly
             if command == "MULTI":
                 await self._handle_multi(writer)
             elif command == "EXEC":
                 await self._handle_exec(writer)
+            # If this client is in a transaction and command is not MULTI/EXEC, queue the command
+            elif writer in self.transactions:
+                # Queue the command for later execution
+                self.transactions[writer]["commands"].append((command, args))
+                # Respond with QUEUED
+                writer.write(RESPProtocol.encode_simple_string("QUEUED"))
             elif command == "PING":
                 writer.write(b"+PONG\r\n")
             elif command == "ECHO" and args:
