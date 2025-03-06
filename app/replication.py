@@ -1,4 +1,4 @@
-from typing import Set, Optional, Tuple, List
+from typing import Set, Optional, Tuple, List, Dict
 from asyncio import StreamWriter, StreamReader
 import asyncio
 from resp import RESPProtocol
@@ -12,6 +12,7 @@ class ReplicationManager:
     def __init__(self):
         self.role: str = "master"
         self.replicas: Set[StreamWriter] = set()
+        self.replica_ack_offsets: Dict[StreamWriter, int] = {}  # Track ACK offsets per replica
         self.master_host: Optional[str] = None
         self.master_port: Optional[int] = None
         self.replica_port: Optional[int] = None
@@ -19,6 +20,7 @@ class ReplicationManager:
         self.master_repl_offset: int = 0
         # Add a counter to track bytes processed from master
         self.processed_bytes: int = 0
+        self.has_pending_writes: bool = False  # Track if we have any pending write operations
     
     def get_empty_rdb(self) -> bytes:
         """Return empty RDB file contents"""
@@ -35,6 +37,14 @@ class ReplicationManager:
                 if not writer.is_closing():
                     writer.write(cmd_bytes)
                     await writer.drain()
+                    
+            # Increment replication offset based on command size
+            # Each command sent increments the offset
+            self.master_repl_offset += len(cmd_bytes)
+            
+            # Mark that we have pending writes that need to be acknowledged
+            self.has_pending_writes = True
+            
         except Exception as e:
             print(f"Error propagating command: {e}")
     
@@ -447,13 +457,48 @@ class ReplicationManager:
             return None, None
 
     async def handle_replconf(self, args: list, writer: StreamWriter) -> None:
-        """Handle REPLCONF command from replica"""
+        """Handle REPLCONF command from client"""
+        if not args:
+            writer.write(RESPProtocol.encode_error("wrong number of arguments for 'replconf' command"))
+            return
+        
+        subcmd = args[0].upper()
         print(f"Received REPLCONF with args: {args}")
-        # Add writer to replicas set if this is a replication connection
-        if args and args[0] == "listening-port":
-            self.replicas.add(writer)
-        writer.write(RESPProtocol.encode_simple_string("OK"))
-        await writer.drain()
+        
+        if subcmd == "LISTENING-PORT" and len(args) >= 2:
+            # Replica is informing us of its listening port
+            try:
+                port = int(args[1])
+                self.replica_port = port
+                # Add writer to replicas set
+                self.replicas.add(writer)
+                writer.write(RESPProtocol.encode_simple_string("OK"))
+            except ValueError:
+                writer.write(RESPProtocol.encode_error("Invalid port number"))
+        
+        elif subcmd == "CAPA" and len(args) >= 2:
+            # Replica is informing us of its capabilities
+            writer.write(RESPProtocol.encode_simple_string("OK"))
+        
+        elif subcmd == "GETACK" and len(args) >= 2:
+            # Master is requesting acknowledgment of processed commands
+            # We need to respond with the current processed bytes
+            ack_response = RESPProtocol.encode_array(["REPLCONF", "ACK", str(self.processed_bytes)])
+            writer.write(ack_response)
+        
+        elif subcmd == "ACK" and len(args) >= 2:
+            # Replica is acknowledging processed commands
+            try:
+                offset = int(args[1])
+                print(f"Received ACK for offset: {offset}")
+                # Update the tracking of acknowledged offsets
+                self.replica_ack_offsets[writer] = offset
+            except ValueError:
+                print(f"Invalid offset in ACK: {args[1]}")
+        
+        else:
+            # Default response for other REPLCONF commands
+            writer.write(RESPProtocol.encode_simple_string("OK"))
 
     async def handle_psync(self, args: list, writer: StreamWriter) -> None:
         """Handle PSYNC command from replica"""
@@ -472,9 +517,25 @@ class ReplicationManager:
         # Add this connection to replicas set if not already added
         self.replicas.add(writer)
 
+    def count_acked_replicas(self, offset: int) -> int:
+        """Count how many replicas have acknowledged up to the given offset"""
+        count = 0
+        for replica, acked_offset in self.replica_ack_offsets.items():
+            if not replica.is_closing() and acked_offset >= offset:
+                count += 1
+        return count
+        
     def cleanup_replicas(self) -> None:
         """Remove closed connections from replicas set"""
-        self.replicas = {w for w in self.replicas if not w.is_closing()} 
+        closed_replicas = {w for w in self.replicas if w.is_closing()}
+        
+        # Remove from replicas set
+        self.replicas -= closed_replicas
+        
+        # Remove from ack tracking
+        for replica in closed_replicas:
+            if replica in self.replica_ack_offsets:
+                del self.replica_ack_offsets[replica]
 
     def find_command_end(self, buffer: bytes) -> int:
         """Find the end position of a complete RESP command in the buffer"""

@@ -34,12 +34,11 @@ class RESPProtocol:
         return length_part + value_bytes + b"\r\n"
     
     @staticmethod
-    def encode_array(value: List[str]) -> bytes:
-        """Encode array: *2\r\n$4\r\nBULK\r\n$4\r\nBULK\r\n"""
-        array = f"*{len(value)}\r\n"
-        for item in value:
-            array += f"${len(item)}\r\n{item}\r\n"
-        return array.encode()
+    def encode_array(items: List[str]) -> bytes:
+        """Encode a list of strings as a RESP array"""
+        encoded_items = [RESPProtocol.encode_bulk_string(item) for item in items]
+        array_data = b"".join(encoded_items)
+        return f"*{len(items)}\r\n".encode() + array_data
     
     @staticmethod
     def parse_command(message: str, remaining: Optional[list] = None) -> Tuple[Optional[str], List[str]]:
