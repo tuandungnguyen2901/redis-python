@@ -5,12 +5,21 @@ from asyncio import StreamReader, StreamWriter
 
 from resp import RESPProtocol
 from replication import ReplicationManager
+from config import Config
 
 class Redis:
-    def __init__(self, port: int):
+    def __init__(self, port: int, dir_path: str = ".", dbfilename: str = "dump.rdb"):
         self.port = port
         self.data_store: Dict[str, Tuple[str, Optional[int]]] = {}
         self.replication = ReplicationManager()
+        self.config = Config()
+        
+        # Set the replica port in the replication manager
+        self.replication.replica_port = port
+        
+        # Initialize configuration with provided values
+        self.config.set("dir", dir_path)
+        self.config.set("dbfilename", dbfilename)
         
     def get_current_time_ms(self) -> int:
         return int(time.time() * 1000)
@@ -159,6 +168,17 @@ class Redis:
                 await self._handle_set(args, writer)
             elif command == "GET":
                 await self._handle_get(args, writer)
+            elif command == "CONFIG" and len(args) >= 2 and args[0].upper() == "GET":
+                # Handle CONFIG GET command
+                if len(args) < 2:
+                    writer.write(RESPProtocol.encode_error("wrong number of arguments for CONFIG GET"))
+                else:
+                    param = args[1]
+                    value = self.config.get(param)
+                    
+                    # Create array with param and value
+                    response_array = [param, str(value) if value is not None else ""]
+                    writer.write(RESPProtocol.encode_array(response_array))
             elif command == "WAIT":
                 # Process WAIT command - wait for replica acknowledgments
                 num_replicas = 0

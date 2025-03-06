@@ -216,39 +216,53 @@ class ReplicationManager:
             print("Master connection handler finished")
     
     async def connect_to_master(self) -> Tuple[Optional[StreamReader], Optional[StreamWriter]]:
-        """Establish connection to master and perform handshake"""
+        """Connect to master server and perform initial handshake"""
+        
+        if not self.master_host or not self.master_port:
+            print("Error: Master host and port not set")
+            return None, None
+        
         try:
-            if not self.master_host or not self.master_port:
-                return None, None
-                
+            print(f"Connecting to master at {self.master_host}:{self.master_port}")
+            
             reader, writer = await asyncio.open_connection(self.master_host, self.master_port)
-            print(f"Connected to master at {self.master_host}:{self.master_port}")
             
-            # Send PING
-            writer.write(b"*1\r\n$4\r\nPING\r\n")
-            await writer.drain()
+            # Make sure the replica port is set (not None)
+            if self.replica_port is None:
+                # Default to the "local port" of the connection if we can detect it
+                sockname = writer.get_extra_info('sockname')
+                if sockname and len(sockname) > 1:
+                    self.replica_port = sockname[1]
+                else:
+                    # If we can't get the local port, use a fixed port of 6380
+                    # This isn't ideal but better than None
+                    self.replica_port = 6380
+                
+            print(f"Using replica port: {self.replica_port}")
             
-            # Read PONG
-            response = await reader.read(1024)
-            if not response or not response.startswith(b"+PONG"):
-                print(f"Unexpected PING response: {response!r}")
+            # Send PING to check connection
+            ping_cmd = RESPProtocol.encode_array(["PING"])
+            writer.write(ping_cmd)
+            
+            # Expect PONG response
+            response = await reader.readuntil(b"\r\n")
+            if not response.startswith(b"+PONG"):
+                print(f"Error: Expected PONG, got {response.decode().strip()}")
                 writer.close()
                 return None, None
-            print(f"Received PING response: {response!r}")
             
-            # Send REPLCONF listening-port with replica's own port
-            port_str = str(self.replica_port)
-            port_cmd = RESPProtocol.encode_array(["REPLCONF", "listening-port", port_str])
-            writer.write(port_cmd)
-            await writer.drain()
+            # Handshake step 1: Send listening port
+            replconf_port = RESPProtocol.encode_array(["REPLCONF", "listening-port", str(self.replica_port)])
+            writer.write(replconf_port)
             
-            # Read OK for listening-port
-            response = await reader.read(1024)
-            if not response or not response.startswith(b"+OK"):
-                print(f"Unexpected REPLCONF response: {response!r}")
+            # Expect OK response
+            response = await reader.readuntil(b"\r\n")
+            if not response.startswith(b"+OK"):
+                print(f"Error: Expected OK for REPLCONF listening-port, got {response.decode().strip()}")
                 writer.close()
                 return None, None
-            print(f"Received REPLCONF response: {response!r}")
+            
+            # Continue with rest of handshake...
             
             # Send REPLCONF capa psync2
             capa_cmd = RESPProtocol.encode_array(["REPLCONF", "capa", "psync2"])
