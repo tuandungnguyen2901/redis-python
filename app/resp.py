@@ -77,4 +77,97 @@ class RESPProtocol:
             return command, args
             
         except (ValueError, IndexError):
-            return None, [] 
+            return None, []
+    
+    @classmethod
+    def decode_array(cls, data):
+        """Decode a RESP array.
+        Returns (parsed_array, original_data, remaining_data)
+        If the array is incomplete, returns (None, None, original_data)
+        """
+        if not data.startswith(b'*'):
+            # Not an array
+            return None, None, data
+        
+        # Find the end of the length indicator
+        idx = data.find(b'\r\n')
+        if idx == -1:
+            # Incomplete array length
+            return None, None, data
+        
+        try:
+            # Parse the array length
+            length = int(data[1:idx])
+        except ValueError:
+            # Invalid length
+            return None, None, data[idx+2:]
+        
+        # Start parsing array elements
+        remaining = data[idx+2:]
+        elements = []
+        original_data = data
+        
+        for _ in range(length):
+            if not remaining:
+                # Incomplete array
+                return None, None, original_data
+            
+            element_type = remaining[0:1]
+            
+            if element_type == b'$':  # Bulk string
+                # Find string length
+                len_end = remaining.find(b'\r\n')
+                if len_end == -1:
+                    return None, None, original_data
+                
+                try:
+                    str_len = int(remaining[1:len_end])
+                except ValueError:
+                    # Skip invalid length
+                    return None, None, original_data
+                
+                if str_len == -1:  # Null bulk string
+                    elements.append(None)
+                    remaining = remaining[len_end+2:]
+                    continue
+                
+                # Check if we have enough data
+                if len(remaining) < len_end + 2 + str_len + 2:
+                    return None, None, original_data
+                
+                # Extract the string
+                str_value = remaining[len_end+2:len_end+2+str_len]
+                elements.append(str_value.decode('utf-8', errors='ignore'))
+                remaining = remaining[len_end+2+str_len+2:]
+            
+            elif element_type == b':':  # Integer
+                # Find integer end
+                int_end = remaining.find(b'\r\n')
+                if int_end == -1:
+                    return None, None, original_data
+                
+                try:
+                    int_value = int(remaining[1:int_end])
+                    elements.append(int_value)
+                except ValueError:
+                    # Skip invalid integer
+                    return None, None, original_data
+                
+                remaining = remaining[int_end+2:]
+            
+            elif element_type in (b'+', b'-'):  # Simple string or error
+                # Find string end
+                str_end = remaining.find(b'\r\n')
+                if str_end == -1:
+                    return None, None, original_data
+                
+                str_value = remaining[1:str_end].decode('utf-8', errors='ignore')
+                elements.append(str_value)
+                remaining = remaining[str_end+2:]
+            
+            else:
+                # Unknown element type, skip this array
+                return None, None, original_data
+        
+        # Successfully parsed the entire array
+        return elements, original_data, remaining 

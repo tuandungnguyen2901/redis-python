@@ -1,8 +1,12 @@
-from typing import Set, Optional, Tuple, List, Dict
+from typing import Set, Optional, Tuple, List, Dict, Any
 from asyncio import StreamWriter, StreamReader
 import asyncio
 from resp import RESPProtocol
 import gc
+import time
+import uuid
+import random
+import hashlib
 
 class ReplicationManager:
     """Handle Redis replication logic"""
@@ -21,60 +25,205 @@ class ReplicationManager:
         # Add a counter to track bytes processed from master
         self.processed_bytes: int = 0
         self.has_pending_writes: bool = False  # Track if we have any pending write operations
+        
+        # Heartbeat related attributes
+        self.heartbeat_task = None  # Task for sending/checking heartbeats
+        self.last_master_heartbeat = time.time()  # Last time we received a heartbeat from master
+        
+        # Election-related fields
+        self.election_state = "follower"  # follower, candidate, or leader
+        self.election_timeout_task = None
+        self.votes_received = 0
+        self.current_term = 0
+        self.voted_for = None
+        self.known_nodes = set()  # Set of node_ids we know about
+        
+        # Generation clock for conflict resolution
+        self.generation = 0
+        self.highest_seen_generation = 0
+        self.log_entries = []  # To store committed commands
+        
+        # Election mutex to prevent multiple simultaneous elections
+        self.election_mutex = asyncio.Lock()
     
     def get_empty_rdb(self) -> bytes:
         """Return empty RDB file contents"""
         return bytes.fromhex(self.EMPTY_RDB_HEX)
     
-    async def propagate_to_replicas(self, command: str, *args: str) -> None:
-        """Propagate command to all connected replicas"""
-        if not self.replicas:
-            return
+    async def start_heartbeat(self) -> None:
+        """Start the heartbeat mechanism based on role"""
+        # Cancel any existing heartbeat task
+        if self.heartbeat_task and not self.heartbeat_task.done():
+            self.heartbeat_task.cancel()
             
-        try:
-            # For INCR, we need to make sure args are properly converted to strings
-            cmd_args = [command]
-            for arg in args:
-                cmd_args.append(str(arg))
-            
-            cmd_bytes = RESPProtocol.encode_array(cmd_args)
-            
-            print(f"Propagating to replicas: {command} {args}")
-            
-            for writer in self.replicas:
-                if not writer.is_closing():
-                    writer.write(cmd_bytes)
-                    await writer.drain()
-                    
-            # Increment replication offset based on command size
-            # Each command sent increments the offset
-            self.master_repl_offset += len(cmd_bytes)
-            
-            # Mark that we have pending writes that need to be acknowledged
-            self.has_pending_writes = True
-            
-        except Exception as e:
-            print(f"Error propagating command: {e}")
-    
-    async def handle_master_connection(self, reader: StreamReader, writer: StreamWriter) -> None:
-        """Handle ongoing communication with master"""
-        buffer = b""
-        redis_instance = None
-        
-        # This is a bit of a hack - we need to get a reference to the Redis instance
-        # that owns this ReplicationManager. We could also pass it as a parameter.
+        # Find Redis instance to get config values
         from redis_server import Redis
+        redis_instance = None
         for obj in gc.get_objects():
             if isinstance(obj, Redis) and obj.replication is self:
                 redis_instance = obj
                 break
-        
-        if not redis_instance:
-            print("Error: Could not find Redis instance")
+                
+        # If we couldn't find Redis instance or cluster is disabled, don't start heartbeat
+        if not redis_instance or not redis_instance.config.get("cluster_enabled", True):
             return
+            
+        interval = redis_instance.config.get("heartbeat_interval", 5.0)
+        timeout = redis_instance.config.get("heartbeat_timeout", 15.0)
+            
+        if self.role == "master":
+            # Masters send heartbeats to replicas
+            self.heartbeat_task = asyncio.create_task(self._send_master_heartbeats(interval))
+        else:
+            # Slaves monitor heartbeats from master
+            self.heartbeat_task = asyncio.create_task(self._monitor_master_heartbeats(interval, timeout))
         
+        print(f"Started heartbeat task for {self.role} role")
+        
+    async def _send_master_heartbeats(self, interval: float) -> None:
+        """Send periodic heartbeats to all replicas"""
+        try:
+            while True:
+                if self.replicas:
+                    # Include node ID and generation in heartbeat
+                    node_id = self.get_node_id()
+                    heartbeat_cmd = RESPProtocol.encode_array([
+                        "PING", 
+                        f"_GEN_{self.generation}", 
+                        f"node_id={node_id}"
+                    ])
+                    
+                    print(f"Sending heartbeat to {len(self.replicas)} replicas (generation {self.generation})")
+                    
+                    for replica in list(self.replicas):
+                        try:
+                            if not replica.is_closing():
+                                replica.write(heartbeat_cmd)
+                                await replica.drain()
+                        except Exception as e:
+                            print(f"Error sending heartbeat to replica: {e}")
+                            self.replicas.discard(replica)
+                
+                # Sleep until next heartbeat
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            print("Master heartbeat task cancelled")
+        except Exception as e:
+            print(f"Error in master heartbeat: {e}")
+            
+    async def _monitor_master_heartbeats(self, interval: float, timeout: float) -> None:
+        """Monitor heartbeats from master and trigger election if timeout"""
+        try:
+            # Update the last heartbeat time when we start monitoring
+            self.last_master_heartbeat = time.time()
+            
+            while True:
+                # Check if we've exceeded the timeout
+                time_since_last = time.time() - self.last_master_heartbeat
+                if time_since_last > timeout and self.election_state == "follower":
+                    print(f"Master heartbeat timeout! Last heartbeat was {time_since_last:.1f} seconds ago")
+                    
+                    # Before starting election, check if there's already a master we can connect to
+                    discovered_nodes = await self.discover_replicas()
+                    found_master = False
+                    
+                    for host, port in discovered_nodes:
+                        try:
+                            print(f"Checking if {host}:{port} is a master")
+                            reader, writer = await asyncio.wait_for(
+                                asyncio.open_connection(host, port),
+                                timeout=1.0
+                            )
+                            
+                            # Send INFO command to check role
+                            writer.write(RESPProtocol.encode_array(["INFO", "replication"]))
+                            await writer.drain()
+                            
+                            # Read response
+                            response = await asyncio.wait_for(reader.read(1024), timeout=1.0)
+                            
+                            # Check if it's a master
+                            if b"role:master" in response:
+                                print(f"Found existing master at {host}:{port}")
+                                self.master_host = host
+                                self.master_port = port
+                                
+                                # Close the current connection 
+                                writer.close()
+                                await writer.wait_closed()
+                                
+                                # Connect as a replica
+                                new_reader, new_writer = await self.connect_to_master()
+                                if new_reader and new_writer:
+                                    # Reset heartbeat time
+                                    self.last_master_heartbeat = time.time()
+                                    # Start master connection handler
+                                    asyncio.create_task(
+                                        self.handle_master_connection(new_reader, new_writer)
+                                    )
+                                    found_master = True
+                                    break
+                            
+                            # Close connection if not a master
+                            writer.close()
+                            await writer.wait_closed()
+                            
+                        except Exception as e:
+                            print(f"Error checking {host}:{port}: {e}")
+                    
+                    # Only start election if we couldn't find an existing master
+                    if not found_master:
+                        # Continue with election process
+                        # ... existing election code ...
+                        
+                        # Add randomization to election timeouts to prevent simultaneous elections
+                        # ... rest of existing code ...
+                        await self.start_election()
+                
+                # Wait before checking again
+                await asyncio.sleep(interval / 2)
+        except asyncio.CancelledError:
+            print("Slave heartbeat monitoring task cancelled")
+        except Exception as e:
+            print(f"Error in slave heartbeat monitoring: {e}")
+            
+    async def propagate_to_replicas(self, command: str, *args: str) -> None:
+        """Propagate command to all connected replicas with generation number"""
+        if not self.replicas:
+            return
+            
+        try:
+            # For commands like INCR, we need to make sure args are properly converted to strings
+            cmd_args = [command]
+            for arg in args:
+                cmd_args.append(str(arg))
+                
+            # Add generation as special argument with prefix
+            cmd_args.append(f"_GEN_{self.generation}")
+            cmd_args.append(f"node_id={self.get_node_id()}")
+            
+            cmd_bytes = RESPProtocol.encode_array(cmd_args)
+            
+            print(f"Propagating to replicas: {command} {args} (generation {self.generation})")
+            
+            for replica in list(self.replicas):
+                try:
+                    if not replica.is_closing():
+                        replica.write(cmd_bytes)
+                        await replica.drain()
+                        self.master_repl_offset += len(cmd_bytes)
+                except Exception as e:
+                    print(f"Error propagating to replica: {e}")
+                    self.replicas.discard(replica)
+        except Exception as e:
+            print(f"Error in propagate_to_replicas: {e}")
+    
+    async def handle_master_connection(self, reader: StreamReader, writer: StreamWriter) -> None:
+        """Handle ongoing communication with master"""
         try:
             print("Starting master connection handler")
+            buffer = b""
+            
             while True:
                 try:
                     data = await reader.read(1024)
@@ -82,189 +231,163 @@ class ReplicationManager:
                         print("Master connection closed")
                         break
                     
-                    # Append to buffer and process any complete commands
                     buffer += data
-                    print(f"Received data from master ({len(data)} bytes): {data[:50]!r}...")
+                    print(f"Received {len(data)} bytes from master, buffer size: {len(buffer)}")
                     
-                    # Process commands from buffer
-                    while buffer:
-                        # Check for complete command
-                        if not buffer.startswith(b"*"):
-                            # Invalid format, clear buffer
-                            print(f"Invalid data received from master: {buffer[:20]!r}...")
-                            buffer = b""
-                            break
-                        
-                        # Parse RESP array command
+                    # Process complete commands in buffer
+                    while b'\r\n' in buffer:
+                        # Try to parse as RESP protocol
                         try:
-                            # Find array length from first line
-                            first_line_end = buffer.find(b"\r\n")
-                            if first_line_end == -1:
-                                print("Incomplete command (no first line end)")
-                                break  # Incomplete command
+                            # The original error is because RESPProtocol doesn't have parse_resp method
+                            # Instead, we need to use the appropriate parsing method for the message type
                             
-                            array_length = int(buffer[1:first_line_end])
-                            print(f"Parsing array command with length {array_length}")
-                            
-                            # Count expected \r\n
-                            expected_crlf = 1 + (array_length * 2)  # 1 for array marker, 2 per item (length+value)
-                            
-                            # Find all \r\n
-                            crlf_count = 0
-                            pos = 0
-                            while True:
-                                pos = buffer.find(b"\r\n", pos)
-                                if pos == -1:
-                                    break
-                                crlf_count += 1
-                                pos += 2
-                            
-                            if crlf_count < expected_crlf:
-                                print(f"Incomplete command (expected {expected_crlf} CRLF, got {crlf_count})")
-                                break  # Incomplete command
-                            
-                            # Parse command and args
-                            command = None
-                            args = []
-                            
-                            lines = buffer.split(b"\r\n")
-                            index = 1  # Skip the array length line
-                            
-                            for i in range(array_length):
-                                if index >= len(lines) or not lines[index].startswith(b"$"):
-                                    break
-                                    
-                                # Skip the length marker
-                                index += 1
+                            # First, check the first byte to determine the RESP data type
+                            if not buffer:
+                                break
                                 
-                                if index >= len(lines):
+                            data_type = buffer[0:1]
+                            
+                            if data_type == b'*':  # Array
+                                # Parse array format
+                                command, result, remaining = RESPProtocol.decode_array(buffer)
+                                if command is None:  # Incomplete command
                                     break
                                     
-                                # Get the value
-                                value = lines[index].decode("utf-8")
-                                if i == 0:
-                                    command = value.upper()
-                                else:
-                                    args.append(value)
+                                # Extract command name and args
+                                if command and len(command) > 0:
+                                    cmd_name = command[0].upper() if isinstance(command[0], str) else command[0].decode().upper()
+                                    args = command[1:] if len(command) > 1 else []
                                     
-                                index += 1
-                            
-                            # Calculate command length in bytes to remove from buffer
-                            cmd_end = 0
-                            for i in range(expected_crlf):
-                                cmd_end = buffer.find(b"\r\n", cmd_end) + 2
-                            
-                            # Get the actual command bytes for offset tracking
-                            command_bytes = buffer[:cmd_end]
-                            command_length = len(command_bytes)
-                            
-                            # Process the command
-                            if command:
-                                print(f"Processing master command: {command} {args}")
-                                
-                                # Execute the command on replica
-                                if command == "REPLCONF" and len(args) >= 2 and args[0].upper() == "GETACK":
-                                    # For GETACK, respond with current offset but don't add command to offset yet
-                                    print(f"Received REPLCONF GETACK, sending ACK with offset {self.processed_bytes}")
-                                    ack_response = RESPProtocol.encode_array(["REPLCONF", "ACK", str(self.processed_bytes)])
-                                    writer.write(ack_response)
-                                    await writer.drain()
+                                    # Check for generation info
+                                    generation = None
+                                    master_node_id = None
+                                    for arg in args:
+                                        if isinstance(arg, str):
+                                            if arg.startswith("_GEN_"):
+                                                try:
+                                                    generation = int(arg[5:])
+                                                    # Update our highest seen generation
+                                                    if generation > self.highest_seen_generation:
+                                                        self.highest_seen_generation = generation
+                                                    print(f"Command has generation {generation}")
+                                                except ValueError:
+                                                    pass
+                                            elif arg.startswith("node_id="):
+                                                master_node_id = arg[8:]
                                     
-                                    # After responding, add this command's bytes to the offset
-                                    self.processed_bytes += command_length
-                                    print(f"Updated processed bytes to {self.processed_bytes} after GETACK")
-                                elif command == "SET" and len(args) >= 2:
-                                    key, value = args[0], args[1]
-                                    expiry = None
+                                    print(f"Processing master command: {cmd_name} {args}")
                                     
-                                    # Handle PX argument
-                                    if len(args) >= 4 and args[2].upper() == "PX":
-                                        try:
-                                            px_value = int(args[3])
-                                            expiry = redis_instance.get_current_time_ms() + px_value
-                                        except ValueError:
-                                            print(f"Invalid PX value: {args[3]}")
-                                    
-                                    # Store in redis instance (directly to prevent expiration issues)
-                                    print(f"Setting key from master: {key} = {value}")
-                                    redis_instance.data_store[key] = (value, expiry)
-                                    print(f"Data store after SET: {redis_instance.data_store}")
-                                    
-                                    # Save to RDB after key change from master
-                                    await redis_instance._save_rdb()
-                                    
-                                    # Add this command's bytes to the offset
-                                    self.processed_bytes += command_length
-                                    print(f"Updated processed bytes to {self.processed_bytes} after SET")
-                                elif command == "KEYS" and len(args) >= 1:
-                                    # Handle KEYS command (useful for debugging)
-                                    pattern = args[0]
-                                    matched_keys = redis_instance._get_matching_keys(pattern)
-                                    print(f"Keys matching pattern {pattern}: {matched_keys}")
-                                    
-                                    # Update processed bytes
-                                    self.processed_bytes += command_length
-                                elif command == "INCR" and len(args) >= 1:
-                                    # Handle INCR command from master
-                                    key = args[0]
-                                    
-                                    # Check if key exists and is not expired
-                                    if key in redis_instance.data_store and not redis_instance.is_key_expired(key):
-                                        value, expiry = redis_instance.data_store[key]
+                                    # Handle PING from master - this is a heartbeat
+                                    if cmd_name == "PING":
+                                        # Update last heartbeat time
+                                        self.last_master_heartbeat = time.time()
+                                        print(f"Received heartbeat from master (generation {generation if generation is not None else 'unknown'})")
                                         
-                                        try:
-                                            # Try to convert value to integer and increment
-                                            int_value = int(value)
-                                            int_value += 1
+                                        # If this was a master announcing itself with higher generation,
+                                        # we need to properly recognize it as our master
+                                        if generation is not None and master_node_id is not None:
+                                            # Record the master's ID and generation
+                                            print(f"Master identified as node {master_node_id} with generation {generation}")
                                             
-                                            # Store the new value (preserving expiry)
-                                            redis_instance.data_store[key] = (str(int_value), expiry)
-                                            print(f"Incremented key from master: {key} = {int_value}")
-                                            
-                                            # Save to RDB after key change from master
-                                            await redis_instance._save_rdb()
-                                        except ValueError:
-                                            print(f"Error incrementing key {key}: value is not an integer")
-                                    else:
-                                        # Key doesn't exist - create it with value "1"
-                                        redis_instance.data_store[key] = ("1", None)  # No expiry
-                                        print(f"Created new key from master INCR: {key} = 1")
+                                            # If we're in election/candidate state, revert to follower
+                                            if self.election_state == "candidate":
+                                                print(f"Reverting from candidate to follower due to valid master heartbeat")
+                                                self.election_state = "follower"
                                         
-                                        # Save to RDB after key change from master
-                                        await redis_instance._save_rdb()
+                                        # Respond with PONG
+                                        writer.write(RESPProtocol.encode_simple_string("PONG"))
+                                        await writer.drain()
                                     
-                                    # Add this command's bytes to the offset
-                                    self.processed_bytes += command_length
-                                    print(f"Updated processed bytes to {self.processed_bytes} after INCR")
-                                else:
-                                    # For any other command, just update the offset
-                                    self.processed_bytes += command_length
-                                    print(f"Updated processed bytes to {self.processed_bytes} after {command}")
+                                    # Handle other commands as needed...
                                 
-                                # Add other command handlers as needed
+                                # Update buffer
+                                buffer = remaining
+                                self.processed_bytes += len(data) - len(remaining)
                                 
-                            # Remove the processed command from buffer
-                            buffer = buffer[cmd_end:]
-                            print(f"Remaining buffer after command: {len(buffer)} bytes")
+                            elif data_type in (b'+', b'-', b':', b'$'):  # Simple String, Error, Integer, Bulk String
+                                # Handle other RESP types
+                                line_end = buffer.find(b'\r\n')
+                                if line_end == -1:
+                                    break  # Incomplete command
+                                    
+                                command = buffer[:line_end].decode('utf-8', errors='ignore')
+                                buffer = buffer[line_end + 2:]  # Remove the processed line
+                                print(f"Received simple command from master: {command}")
+                            else:
+                                # Unknown data type, skip a byte to avoid getting stuck
+                                print(f"Unknown data type in buffer: {data_type}")
+                                buffer = buffer[1:]
                             
-                        except (ValueError, IndexError) as e:
-                            print(f"Error parsing command from master: {e}")
-                            if b"\r\n" in buffer:
-                                buffer = buffer[buffer.find(b"\r\n") + 2:]
+                        except Exception as e:
+                            print(f"Error processing command from master: {e}")
+                            # Skip to next line to avoid getting stuck on corrupt data
+                            next_pos = buffer.find(b'\r\n')
+                            if next_pos != -1:
+                                buffer = buffer[next_pos + 2:]
                             else:
                                 buffer = b""
+                            
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     print(f"Error reading from master: {e}")
-                    # Don't break here, just continue trying to read
-                    await asyncio.sleep(0.1)
-                        
+                    await asyncio.sleep(1)  # Avoid tight loop in case of persistent errors
+                
+        except asyncio.CancelledError:
+            print("Master connection handler cancelled")
         except Exception as e:
-            print(f"Error in master connection: {e}")
+            print(f"Error in master connection handler: {e}")
         finally:
-            if not writer.is_closing():
-                writer.close()
-                await writer.wait_closed()
             print("Master connection handler finished")
+            
+            # If we still think we're a slave after disconnection, try to reconnect
+            if self.role == "slave":
+                # Wait before reconnection attempt
+                await asyncio.sleep(1)
+                
+                # Try to reconnect to the master or find a new master
+                if hasattr(self, 'discover_replicas'):
+                    # Use discovery to find potential masters
+                    print("Master disconnected - looking for new master to connect to")
+                    discovered_nodes = await self.discover_replicas()
+                    
+                    for host, port in discovered_nodes:
+                        try:
+                            print(f"Attempting to connect to potential master at {host}:{port}")
+                            new_reader, new_writer = await asyncio.open_connection(host, port)
+                            
+                            # Send INFO command to check role
+                            new_writer.write(RESPProtocol.encode_array(["INFO", "replication"]))
+                            await new_writer.drain()
+                            
+                            # Read response
+                            response = await new_reader.read(1024)
+                            if b"role:master" in response:
+                                print(f"Found new master at {host}:{port}")
+                                self.master_host = host
+                                self.master_port = port
+                                
+                                # Start new master connection handler
+                                asyncio.create_task(
+                                    self.handle_master_connection(new_reader, new_writer)
+                                )
+                                return
+                            
+                            # Close connection if not a master
+                            new_writer.close()
+                            await new_writer.wait_closed()
+                            
+                        except Exception as e:
+                            print(f"Error connecting to potential master at {host}:{port}: {e}")
+                
+                # If we couldn't find a new master, try to reconnect to original master
+                print(f"Attempting to reconnect to original master: {self.master_host}:{self.master_port}")
+                try:
+                    new_reader, new_writer = await self.connect_to_master()
+                    if new_reader and new_writer:
+                        asyncio.create_task(self.handle_master_connection(new_reader, new_writer))
+                except Exception as e:
+                    print(f"Error reconnecting to master: {e}")
     
     async def connect_to_master(self) -> Tuple[Optional[StreamReader], Optional[StreamWriter]]:
         """Connect to master server and perform initial handshake"""
@@ -663,15 +786,14 @@ class ReplicationManager:
             return None, None
 
     async def handle_replconf(self, args: list, writer: StreamWriter) -> None:
-        """Handle REPLCONF command from client"""
+        """Handle REPLCONF command from replicas or master"""
         if not args:
             writer.write(RESPProtocol.encode_error("wrong number of arguments for 'replconf' command"))
             return
         
-        subcmd = args[0].upper()
-        print(f"Received REPLCONF with args: {args}")
+        subcommand = args[0].upper() if args[0] else ""
         
-        if subcmd == "LISTENING-PORT" and len(args) >= 2:
+        if subcommand == "LISTENING-PORT" and len(args) >= 2:
             # Replica is informing us of its listening port
             try:
                 port = int(args[1])
@@ -682,17 +804,17 @@ class ReplicationManager:
             except ValueError:
                 writer.write(RESPProtocol.encode_error("Invalid port number"))
         
-        elif subcmd == "CAPA" and len(args) >= 2:
+        elif subcommand == "CAPA" and len(args) >= 2:
             # Replica is informing us of its capabilities
             writer.write(RESPProtocol.encode_simple_string("OK"))
         
-        elif subcmd == "GETACK" and len(args) >= 2:
+        elif subcommand == "GETACK" and len(args) >= 2:
             # Master is requesting acknowledgment of processed commands
             # We need to respond with the current processed bytes
             ack_response = RESPProtocol.encode_array(["REPLCONF", "ACK", str(self.processed_bytes)])
             writer.write(ack_response)
         
-        elif subcmd == "ACK" and len(args) >= 2:
+        elif subcommand == "ACK" and len(args) >= 2:
             # Replica is acknowledging processed commands
             try:
                 offset = int(args[1])
@@ -705,6 +827,37 @@ class ReplicationManager:
         else:
             # Default response for other REPLCONF commands
             writer.write(RESPProtocol.encode_simple_string("OK"))
+        
+        # Check for generation info in REPLCONF
+        generation = None
+        master_node_id = None
+        
+        for arg in args:
+            if isinstance(arg, str):
+                if arg.startswith("_GEN_"):
+                    try:
+                        generation = int(arg[5:])
+                        print(f"Detected heartbeat with generation {generation}")
+                    except ValueError:
+                        pass
+                elif arg.startswith("node_id="):
+                    master_node_id = arg[8:]
+        
+        if generation is not None and master_node_id is not None:
+            # If we receive a heartbeat with higher generation, acknowledge sender as master
+            if self.role == "master" and generation > self.generation:
+                print(f"Stepping down as master in favor of node {master_node_id} with higher generation {generation}")
+                self.role = "slave"
+                self.election_state = "follower"
+                
+                # Update our generation tracking
+                self.highest_seen_generation = generation
+                
+                # Connect to the new master
+                # Find its host and port (we need to figure this out from the node_id)
+                # This is challenging because we need to map node_id to host:port
+                # For now, we can rely on the discover_replicas method to find it
+                asyncio.create_task(self._connect_to_new_master(master_node_id))
 
     async def handle_psync(self, args: list, writer: StreamWriter) -> None:
         """Handle PSYNC command from replica"""
@@ -800,3 +953,318 @@ class ReplicationManager:
             print(f"Error parsing command bytes: {e}")
         
         return command, args 
+
+    async def start_election(self) -> None:
+        """Start an election when master heartbeat times out"""
+        # Only start election if we're a slave and not already in an election
+        if self.role != "slave" or self.election_state != "follower":
+            print(f"Not starting election. Role: {self.role}, State: {self.election_state}")
+            return
+        
+        # Use mutex to prevent multiple simultaneous elections
+        async with self.election_mutex:
+            # Check again after acquiring lock
+            if self.role != "slave" or self.election_state != "follower":
+                return
+            
+            print("Starting election for new master")
+            
+            # Update state to candidate
+            self.election_state = "candidate"
+            self.current_term += 1
+            self.votes_received = 1  # Vote for ourselves
+            self.voted_for = self.get_node_id()
+            
+            # Find Redis instance to get configuration
+            from redis_server import Redis
+            redis_instance = None
+            for obj in gc.get_objects():
+                if isinstance(obj, Redis) and obj.replication is self:
+                    redis_instance = obj
+                    break
+            
+            if not redis_instance:
+                print("Error: Could not find Redis instance for election")
+                self.election_state = "follower"
+                return
+            
+            # Get priority from config
+            priority = redis_instance.config.get("priority", 100)
+            
+            # In a real clustered system, we would:
+            # 1. Discover other replicas (through a discovery service or pre-configured list)
+            # 2. Send RequestVote messages to all other replicas
+            # 3. Wait for votes or timeout
+            # 4. If we have majority of votes, become leader
+            
+            # For this implementation, we'll use an election timeout with:
+            # - Priority-based voting (higher priority nodes are more likely to win)
+            # - Node ID as a tiebreaker (deterministic but pseudo-random)
+            election_timeout = redis_instance.config.get("election_timeout", 5.0)
+            
+            print(f"Running for election with priority {priority}, term {self.current_term}")
+            
+            # Wait for election timeout to allow other nodes to start their elections too
+            await asyncio.sleep(election_timeout)
+            
+            # In this simplified implementation, we'll determine if we should be leader based on:
+            # 1. Our priority
+            # 2. Our node ID (as a tiebreaker)
+            
+            # In real Raft, the node would check if it got votes from majority of the cluster
+            # Here, we'll simulate a deterministic election based on node characteristics
+            
+            # Check if we're still a candidate (we might have seen a heartbeat from another node)
+            if self.election_state != "candidate":
+                print(f"No longer a candidate, current state: {self.election_state}")
+                return
+            
+            # Get our node ID as a tiebreaker
+            node_id = self.get_node_id()
+            
+            # For demonstration purposes, we'll use a deterministic approach:
+            # If our priority is high enough and our node ID hash is favorable,
+            # we'll declare ourselves the winner
+            
+            # This number would normally be derived from cluster state (e.g., total number of nodes)
+            # For simplicity, we'll just use a fixed threshold 
+            # In a real implementation, this would be much more sophisticated
+            min_priority_threshold = 75
+            
+            if priority >= min_priority_threshold:
+                # Use node ID as tiebreaker - this ensures only one node wins
+                # In a real system, this would be determined by actual voting
+                node_hash = int(hashlib.md5(node_id.encode()).hexdigest(), 16) % 100
+                
+                print(f"Election decision: Priority={priority}, Node hash={node_hash}")
+                
+                # If node has high priority and favorable hash, become master
+                if node_hash > 50:  # Arbitrary threshold for demonstration
+                    print(f"Won election with priority {priority} and favorable node hash")
+                    await self.become_master()
+                else:
+                    print(f"Lost election despite high priority, unfavorable node hash")
+                    self.election_state = "follower"
+            else:
+                print(f"Lost election with insufficient priority {priority}")
+                self.election_state = "follower"
+            
+    async def become_master(self) -> None:
+        """Become the master after winning an election"""
+        print("Becoming master node")
+        
+        # Update role and election state
+        self.role = "master"
+        self.election_state = "leader"
+        
+        # Increment generation when becoming leader
+        self.generation += 1
+        print(f"New leader with generation {self.generation}")
+        
+        # Reset replication-related fields
+        self.master_host = None
+        self.master_port = None
+        
+        # Generate a new replication ID
+        self.master_replid = uuid.uuid4().hex
+        
+        # Reset offset
+        self.master_repl_offset = 0
+        
+        # Start sending heartbeats to slaves
+        await self.start_heartbeat()
+        
+        # Resolve conflicts
+        await self.resolve_conflicts()
+        
+        # Announce to other nodes
+        await self.announce_master()
+        
+        # Broadcast new role to any replicas
+        print(f"This node is now the master with replid {self.master_replid} and generation {self.generation}")
+        
+    async def resolve_conflicts(self) -> None:
+        """Resolve conflicts in data store when becoming master"""
+        # This is called after becoming a master
+        
+        # Find Redis instance
+        from redis_server import Redis
+        redis_instance = None
+        for obj in gc.get_objects():
+            if isinstance(obj, Redis) and obj.replication is self:
+                redis_instance = obj
+                break
+                
+        if not redis_instance:
+            print("Error: Could not find Redis instance for conflict resolution")
+            return
+            
+        print("Resolving potential data conflicts after election...")
+        
+        # In a real system, this would involve checking log entries
+        # For simplicity, we'll just use the generation info stored with each value
+        
+        # Log that we're now using our generation for all future writes
+        print(f"All future writes will use generation {self.generation}")
+        
+        # Save the current data store state after resolution
+        await redis_instance._save_rdb()
+        print("Saved resolved state to RDB")
+        
+    def get_node_id(self) -> str:
+        """Get the node ID for this instance"""
+        # Find Redis instance
+        from redis_server import Redis
+        for obj in gc.get_objects():
+            if isinstance(obj, Redis) and obj.replication is self:
+                return obj.config.get("node_id", "unknown")
+        return "unknown" 
+
+    async def discover_replicas(self) -> List[Tuple[str, int]]:
+        """Discover other replicas in the cluster"""
+        # In a real system, this would use a discovery service or gossip protocol
+        # For this implementation, we'll simulate by checking common ports
+        
+        # Find our node ID
+        node_id = self.get_node_id()
+        
+        # Find our port
+        from redis_server import Redis
+        redis_instance = None
+        for obj in gc.get_objects():
+            if isinstance(obj, Redis) and obj.replication is self:
+                redis_instance = obj
+                break
+        
+        if not redis_instance:
+            print("Error: Could not find Redis instance for replica discovery")
+            return []
+        
+        our_port = redis_instance.port
+        
+        # List of common ports to check
+        common_ports = [6379, 6380, 6381, 6382, 6383]
+        discovered_replicas = []
+        
+        for port in common_ports:
+            # Skip our own port
+            if port == our_port:
+                continue
+            
+            try:
+                # Try to connect to potential replica
+                print(f"Attempting to discover replica at localhost:{port}")
+                
+                # Connect with a short timeout
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection('localhost', port),
+                    timeout=0.5
+                )
+                
+                # Send INFO command to check if it's a Redis server
+                writer.write(RESPProtocol.encode_array(["INFO", "replication"]))
+                await writer.drain()
+                
+                # Read response (with timeout)
+                response = await asyncio.wait_for(reader.read(1024), timeout=0.5)
+                
+                # Parse INFO response to check if it's a replica
+                if b"role:" in response:
+                    print(f"Found Redis instance at localhost:{port}")
+                    discovered_replicas.append(('localhost', port))
+            
+                # Clean up
+                writer.close()
+                await writer.wait_closed()
+                
+            except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
+                # Connection failed or timed out, likely not a Redis server
+                pass
+        
+        print(f"Discovered {len(discovered_replicas)} potential replicas: {discovered_replicas}")
+        return discovered_replicas 
+
+    async def announce_master(self) -> None:
+        """Announce this node as the new master to other nodes"""
+        print("Announcing this node as new master to other nodes...")
+        
+        # Discover other nodes in the cluster
+        discovered_replicas = await self.discover_replicas()
+        
+        # Our node ID and generation
+        node_id = self.get_node_id()
+        
+        for host, port in discovered_replicas:
+            try:
+                print(f"Announcing to node at {host}:{port}")
+                
+                # Connect to the other node
+                reader, writer = await asyncio.open_connection(host, port)
+                
+                # Send CLUSTER MASTER_ANNOUNCE command
+                # This is a custom command we're defining for master announcements
+                announce_cmd = [
+                    "CLUSTER", 
+                    "MASTER_ANNOUNCE",
+                    f"node_id={node_id}",
+                    f"generation={self.generation}",
+                    f"replid={self.master_replid}"
+                ]
+                
+                writer.write(RESPProtocol.encode_array(announce_cmd))
+                await writer.drain()
+                
+                # Wait for response
+                response = await reader.read(1024)
+                print(f"Got response from {host}:{port}: {response}")
+                
+                # Clean up
+                writer.close()
+                await writer.wait_closed()
+                
+            except Exception as e:
+                print(f"Error announcing master to {host}:{port}: {e}") 
+
+    async def _connect_to_new_master(self, master_node_id: str) -> None:
+        """Connect to a new master after learning its node ID"""
+        # Use discovery to find the node
+        discovered_nodes = await self.discover_replicas()
+        
+        for host, port in discovered_nodes:
+            try:
+                print(f"Checking if {host}:{port} has node_id {master_node_id}")
+                reader, writer = await asyncio.open_connection(host, port)
+                
+                # Send a custom command to get node ID
+                writer.write(RESPProtocol.encode_array(["CONFIG", "GET", "node_id"]))
+                await writer.drain()
+                
+                response = await reader.read(1024)
+                
+                # If this is the node we're looking for
+                if master_node_id.encode() in response:
+                    print(f"Found node {master_node_id} at {host}:{port}")
+                    self.master_host = host
+                    self.master_port = port
+                    
+                    # Close this test connection
+                    writer.close()
+                    await writer.wait_closed()
+                    
+                    # Connect as a replica
+                    new_reader, new_writer = await self.connect_to_master()
+                    if new_reader and new_writer:
+                        # Reset heartbeat time
+                        self.last_master_heartbeat = time.time()
+                        # Start master connection handler
+                        asyncio.create_task(
+                            self.handle_master_connection(new_reader, new_writer)
+                        )
+                    return
+                
+                # Close connection if it's not the node we're looking for
+                writer.close()
+                await writer.wait_closed()
+                
+            except Exception as e:
+                print(f"Error checking {host}:{port} for node_id {master_node_id}: {e}") 

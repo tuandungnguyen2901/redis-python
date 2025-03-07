@@ -17,10 +17,22 @@ async def main() -> None:
     parser.add_argument('--replicaof', nargs='+', help='Master host and port for replication')
     parser.add_argument('--dir', type=str, default=".", help='Directory for the RDB file')
     parser.add_argument('--dbfilename', type=str, default="dump.rdb", help='Filename for the RDB file')
+    parser.add_argument('--heartbeat-interval', type=float, default=5.0, help='Seconds between heartbeats')
+    parser.add_argument('--heartbeat-timeout', type=float, default=15.0, help='Seconds before considering master down')
+    parser.add_argument('--election-timeout', type=float, default=5.0, help='Seconds for election process')
+    parser.add_argument('--priority', type=int, default=100, help='Node priority for elections (higher = more likely to become master)')
+    parser.add_argument('--no-cluster', action='store_true', help='Disable cluster features')
     
     args = parser.parse_args()
     
     redis = Redis(args.port, args.dir, args.dbfilename)
+    
+    # Set cluster configuration
+    redis.config.set("heartbeat_interval", args.heartbeat_interval)
+    redis.config.set("heartbeat_timeout", args.heartbeat_timeout)
+    redis.config.set("election_timeout", args.election_timeout)
+    redis.config.set("priority", args.priority)
+    redis.config.set("cluster_enabled", not args.no_cluster)
     
     if args.replicaof:
         redis.replication.role = "slave"

@@ -174,7 +174,26 @@ class Redis:
     async def _execute_command(self, command: str, args: list, writer: StreamWriter) -> None:
         """Execute Redis command and send response"""
         try:
+            # Convert command to uppercase for case-insensitive matching
+            orig_command = command
+            command = command.upper()
             print(f"Executing command: {command}, args: {args}")
+            
+            # Extract generation information if present
+            generation = None
+            for i in range(len(args) - 1, -1, -1):
+                if isinstance(args[i], str) and args[i].startswith("_GEN_"):
+                    try:
+                        generation = int(args[i][5:])
+                        args.pop(i)  # Remove the generation marker
+                        print(f"Detected command from generation {generation}")
+                        
+                        # Update highest seen generation
+                        if generation > self.replication.highest_seen_generation:
+                            self.replication.highest_seen_generation = generation
+                    except ValueError:
+                        pass  # Invalid generation format, ignore
+                    break  # Only process the last generation marker
             
             # List of write commands that modify data
             write_commands = {"SET", "INCR", "DEL", "LPUSH", "RPUSH", "HSET", "SADD", "ZADD", "EXPIRE"}
@@ -340,6 +359,8 @@ class Redis:
                 # Return immediately to avoid the second drain call
                 await writer.drain()
                 return
+            elif command == "CLUSTER":
+                await self._handle_cluster_command(args, writer)
             else:
                 writer.write(RESPProtocol.encode_error("unknown command"))
             
@@ -422,24 +443,28 @@ class Redis:
         return None  # Key not found
         
     async def start(self) -> None:
-        if self.replication.role == "slave":
-            master_reader, master_writer = await self.replication.connect_to_master()
-            if not master_reader or not master_writer:
-                print("Failed to establish connection with master")
-                return
-                
-        server = await asyncio.start_server(self.handle_client, "localhost", self.port)
-        print(f"Server listening on port {self.port}...")
+        """Start the Redis server"""
+        server = await asyncio.start_server(
+            self.handle_client, '0.0.0.0', self.port
+        )
         
+        addr = server.sockets[0].getsockname()
+        print(f'Serving on {addr}')
+        
+        # If this is a slave, connect to master
         if self.replication.role == "slave":
-            async with server:
-                await asyncio.gather(
-                    server.serve_forever(),
-                    self.replication.handle_master_connection(master_reader, master_writer)
-                )
-        else:
-            async with server:
-                await server.serve_forever()
+            print(f"Connecting to master at {self.replication.master_host}:{self.replication.master_port}")
+            reader, writer = await self.replication.connect_to_master()
+            if reader and writer:
+                # Start the master connection handler
+                asyncio.create_task(self.replication.handle_master_connection(reader, writer))
+        
+        # Start the heartbeat mechanism if cluster is enabled
+        if self.config.get("cluster_enabled", True):
+            await self.replication.start_heartbeat()
+        
+        async with server:
+            await server.serve_forever()
 
     def _get_matching_keys(self, pattern: str) -> List[str]:
         """Get keys that match the specified pattern (supporting glob-style pattern)"""
@@ -473,7 +498,7 @@ class Redis:
     async def _handle_incr(self, args: list, writer: StreamWriter) -> None:
         """Handle INCR command - increment the value stored at key by 1"""
         if len(args) != 1:
-            writer.write(RESPProtocol.encode_error("wrong number of arguments for 'incr' command"))
+            writer.write(RESPProtocol.encode_error("ERR wrong number of arguments for 'incr' command"))
             return
         
         key = args[0]
@@ -703,3 +728,59 @@ class Redis:
         except Exception as e:
             print(f"Error forwarding write to master: {e}")
             writer.write(RESPProtocol.encode_error(f"ERR master connection failed: {str(e)}"))
+
+    async def _handle_cluster_command(self, args: list, writer: StreamWriter) -> None:
+        """Handle CLUSTER command and subcommands"""
+        if not args:
+            writer.write(RESPProtocol.encode_error("ERR wrong number of arguments for 'cluster' command"))
+            return
+        
+        subcommand = args[0].upper()
+        
+        if subcommand == "MASTER_ANNOUNCE":
+            # This is a message from a node announcing itself as master
+            node_id = None
+            generation = 0
+            replid = None
+            
+            # Parse arguments
+            for arg in args[1:]:
+                if arg.startswith("node_id="):
+                    node_id = arg[8:]  # Extract after "node_id="
+                elif arg.startswith("generation="):
+                    try:
+                        generation = int(arg[11:])  # Extract after "generation="
+                    except ValueError:
+                        pass
+                elif arg.startswith("replid="):
+                    replid = arg[7:]  # Extract after "replid="
+            
+            # If generation is higher, acknowledge the new master
+            if generation > self.replication.generation or (
+                generation == self.replication.generation and 
+                self.replication.role == "slave"
+            ):
+                print(f"Acknowledging node {node_id} as master with generation {generation}")
+                
+                # If we thought we were master, step down
+                if self.replication.role == "master":
+                    print(f"Stepping down as master in favor of node {node_id} with higher generation")
+                    self.replication.role = "slave"
+                    self.replication.election_state = "follower"
+                
+                # Update our highest seen generation
+                self.replication.highest_seen_generation = max(
+                    self.replication.highest_seen_generation, 
+                    generation
+                )
+                
+                # Acknowledge the announcement
+                writer.write(RESPProtocol.encode_simple_string("OK"))
+            else:
+                # We have a higher generation, reject the announcement
+                print(f"Rejecting master announcement from node {node_id} with lower generation {generation}")
+                writer.write(RESPProtocol.encode_simple_string(
+                    f"REJECTED generation={self.replication.generation} role={self.replication.role}"
+                ))
+        else:
+            writer.write(RESPProtocol.encode_error(f"ERR unknown subcommand '{subcommand}'"))
